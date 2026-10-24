@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,60 @@ _DECIMAL_INTEGER = re.compile(r"[0-9]+\Z")
 
 class ConfigError(ValueError):
     """A safe configuration error that never includes environment values."""
+
+
+def normalize_public_mcp_url(value: str) -> str:
+    """Validate the optional, public endpoint shown in Telegram setup instructions."""
+    error = "PUBLIC_MCP_URL must be an absolute HTTPS URL without credentials, query or fragment."
+    if not isinstance(value, str):
+        raise ConfigError(error)
+    if value == "":
+        return ""
+    if (
+        len(value) > 2048
+        or any(
+            character.isspace() or unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in value
+        )
+        or "?" in value
+        or "#" in value
+    ):
+        raise ConfigError(error)
+    # Telegram counts UTF-16 units. Bound the URL the same way so the complete
+    # guide remains a single message, including non-BMP characters in its path.
+    if len(value.encode("utf-16-le")) // 2 > 2048:
+        raise ConfigError(error)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError:
+        raise ConfigError(error) from None
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.netloc.endswith(":")
+        or (port is not None and not 1 <= port <= 65535)
+        or "%" in hostname
+    ):
+        raise ConfigError(error)
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            hostname = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            raise ConfigError(error) from None
+        if (
+            not hostname
+            or len(hostname) > 253
+            or any(_HOST_LABEL.fullmatch(label) is None for label in hostname.split("."))
+            or all(label.isdecimal() for label in hostname.split("."))
+        ):
+            raise ConfigError(error) from None
+    return value
 
 
 def normalize_api_base_url(value: str) -> str:
@@ -243,6 +298,7 @@ class Config:
     api_base_url: str = DEFAULT_API_BASE_URL
     local_files_root: Path | None = None
     max_attachment_bytes: int = MAX_ATTACHMENT_BYTES
+    public_mcp_url: str = ""
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -275,6 +331,7 @@ class Config:
                 _setting(source, "TELEGRAM_LOCAL_FILES_ROOT"), api_base_url
             ),
             max_attachment_bytes=_parse_attachment_limit(_setting(source, "MAX_ATTACHMENT_BYTES")),
+            public_mcp_url=normalize_public_mcp_url(_setting(source, "PUBLIC_MCP_URL")),
         )
 
     def validate_for_serve(self, transport: str, host: str) -> None:
@@ -282,6 +339,7 @@ class Config:
 
         if not self.bot_token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required to serve.")
+        normalize_public_mcp_url(self.public_mcp_url)
         normalized_api = normalize_api_base_url(self.api_base_url)
         _parse_local_files_root(str(self.local_files_root or ""), normalized_api)
         if (

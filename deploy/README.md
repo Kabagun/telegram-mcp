@@ -1,4 +1,23 @@
-# systemd user deployment
+# Deployment
+
+## Current common server
+
+The shared `apps` user service below is a legacy standalone installation. On the
+current common server, `apps` is the deployment account and Telegram runs as the
+isolated `app-telegram` account. Do not run the legacy installer against it.
+
+Use `/usr/local/bin/appsctl status telegram --json` to inspect the approved app.
+The platform's `apply` operation starts/reconciles an approved external manifest;
+it does not expose package installation, a source revision, or a forced restart.
+Installing a new ready-built Python wheel and restarting the isolated runtime
+requires the administrator's approved delivery procedure. Preserve its protected
+credentials, SQLite data and native Bot API installation.
+
+Set the non-secret `PUBLIC_MCP_URL` to the public HTTPS MCP endpoint to include
+it in `/start` and `/help`. Leaving it empty asks users to obtain the address
+from the administrator. Never include an authentication token in this URL.
+
+## Standalone systemd user installation (legacy)
 
 Build Telegram Bot API and native dependencies on the local workstation for
 Linux ARM64. The production server receives ready artifacts; do not compile

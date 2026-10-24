@@ -111,6 +111,7 @@ class Runtime:
                 username,
                 link_ttl_seconds=self.config.link_ttl_seconds,
                 allowed_group_chat_ids=self.config.allowed_group_chat_ids,
+                public_mcp_url=self.config.public_mcp_url,
             )
             self.inbox = InboxStore(self.config.database_path)
             self.inbound = InboundController(

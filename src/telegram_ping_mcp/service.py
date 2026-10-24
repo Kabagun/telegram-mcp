@@ -10,12 +10,13 @@ import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
+from .onboarding import onboarding_text
 from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 _USERNAME = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
 _COMMAND = re.compile(
-    r"/(start|stop|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
+    r"/(start|help|stop|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
 )
 _MAX_INTEGER = 2**63 - 1
 _FAILED = "Telegram rejected the message."
@@ -92,6 +93,7 @@ class Service:
         *,
         link_ttl_seconds: int = 900,
         allowed_group_chat_ids: frozenset[int] = frozenset(),
+        public_mcp_url: str = "",
     ) -> None:
         if not isinstance(bot_username, str):
             raise ServiceError("Bot username is invalid.")
@@ -108,6 +110,7 @@ class Service:
         self._bot_username = bot_username
         self._link_ttl_seconds = link_ttl_seconds
         self._allowed_group_chat_ids = allowed_group_chat_ids
+        self._onboarding_text = onboarding_text(public_mcp_url)
 
     @property
     def store(self) -> Store:
@@ -328,11 +331,13 @@ class Service:
             entities=entities,
         )
 
-    async def _reply(self, telegram_id: int, text: str) -> None:
+    async def _reply(
+        self, telegram_id: int, text: str, *, deactivate_on_forbidden: bool = True
+    ) -> None:
         try:
             await self._bot.send_message(telegram_id, text)
         except TelegramAPIError as error:
-            if error.code == 403:
+            if error.code == 403 and deactivate_on_forbidden:
                 self._store.set_active_by_telegram(telegram_id, False)
         except TelegramTransportError:
             # The command's durable state is already applied. Never retry the reply.
@@ -367,6 +372,9 @@ class Service:
             return
         if token is not None and name != "start":
             return
+        if name == "help":
+            await self._reply(telegram_id, self._onboarding_text, deactivate_on_forbidden=False)
+            return
         if name == "start" and token is not None:
             username = author.get("username")
             first_name = author.get("first_name", "")
@@ -393,4 +401,6 @@ class Service:
             if user is not None:
                 self._store.delete_user(user["user_key"])
             response = _UNLINKED
+        if name == "start":
+            response += "\n\n" + self._onboarding_text
         await self._reply(telegram_id, response)
