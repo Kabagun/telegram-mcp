@@ -2,20 +2,73 @@
 
 ## Current common server
 
-The shared `apps` user service below is a legacy standalone installation. On the
-current common server, `apps` is the deployment account and Telegram runs as the
-isolated `app-telegram` account. Do not run the legacy installer against it.
+Use the `appsctl` 2026.10.25.5 workflow as the authenticated `apps` deployment
+account. Telegram runs under its separate runtime account. Perform all deployment
+actions as `apps` using the approved workspace and `appsctl`, without sudo or
+shared user services. The standalone installer and systemd/Bot API service
+instructions below are legacy and must not be used on the current common server.
 
-Use `/usr/local/bin/appsctl status telegram --json` to inspect the approved app.
-The platform's `apply` operation starts/reconciles an approved external manifest;
-it does not expose package installation, a source revision, or a forced restart.
-All deployment actions must originate as `apps` through the approved platform
-API. Package updates need an owner-bound artifact/update operation; until the
-platform exposes it, prepare the ready-built wheel without replacing the isolated
-runtime directly. Do not switch to root or revive the shared user service.
-Preserve protected credentials, SQLite data and the native Bot API installation.
-An `apps`-owned staging directory such as `/home/apps/telegram-mcp-artifacts`
-can hold ready artifacts; `/home/apps/temp` is currently root-owned.
+Inspect the existing registration and its assigned workspace before updating:
+
+```sh
+appsctl workspace telegram --json
+appsctl status telegram --json
+```
+
+The workspace response identifies the source directory and separate dependency
+directories. Use those returned paths; do not invent a checkout or dependency
+location. The platform does not fetch Git
+repositories or run package managers as root. Prepare code and dependencies with
+the deployment owner's authorized permissions in the assigned workspace.
+
+Build the application wheel locally and prepare the locked production dependency
+set for the runtime's Python version and Linux ARM64 target. Transfer ready wheels
+and any required native runtime libraries, then install from those artifacts into
+the assigned dependency environment. Require binary dependencies and fail if an
+artifact is missing; do not fall back to a source build. Build Telegram Bot API
+and native dependencies locally as well. Never compile on the production server
+or install build tools there.
+
+Before replacing anything, retain a restorable previous release containing both
+the source/code and its exact dependency set, including native runtime libraries.
+Record how to restore both into their assigned paths. Keeping only an old wheel
+is insufficient for rollback after dependency changes. Keep protected
+configuration, SQLite data and persistent Bot API state outside source replacement;
+preserve their existing paths, permissions and the native Bot API installation.
+Take a consistent database backup before any schema migration.
+
+After preparing the source and dependency directories, restart the application
+with its saved declaration:
+
+```sh
+appsctl restart telegram --json
+appsctl status telegram --json
+```
+
+To reapply the saved capability declaration and force a restart, use:
+
+```sh
+appsctl deploy ~/.config/app-platform/manifests/telegram.yaml --json
+```
+
+`restart` and `deploy` restart the bound application group and check readiness.
+`apply` reconciles capabilities and can reuse a healthy unchanged process, so it
+does not force an updated process to start. Confirm readiness and authenticated
+MCP initialization through the protected client configuration after the update.
+These checks do not require sending a Telegram message.
+
+If an update fails, inspect only the application's bounded log tail:
+
+```sh
+appsctl logs telegram --lines 100
+```
+
+Request fewer lines if the response is truncated. Restore the previous code and
+dependencies together, then run `restart` or deploy the saved declaration again
+and repeat the readiness checks. The controller compensates publication and
+registration changes, but cannot roll back arbitrary writes to application code,
+dependencies or persistent state. Preserve configuration, SQLite and Bot API
+state during recovery; use the migration's backup/restore procedure when needed.
 
 Set the non-secret `PUBLIC_MCP_URL` to the public HTTPS MCP endpoint to include
 it in `/connect`. Leaving it empty asks users to obtain the address
