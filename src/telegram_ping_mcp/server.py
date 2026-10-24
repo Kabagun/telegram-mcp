@@ -23,10 +23,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .attachments import AttachmentContent, attachment_content
 from .config import Config
 from .inbox import InboundController, InboxStore
+from .onboarding import command_menu
 from .polling import Poller
 from .service import Service, ServiceError
 from .store import Store
-from .telegram import TelegramClient
+from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,10 @@ class Runtime:
             username = me.get("username")
             if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
                 raise StartupError("Telegram bot must have a valid username.")
+            try:
+                await self.bot.set_commands(command_menu())
+            except (TelegramAPIError, TelegramTransportError):
+                logger.warning("Telegram default command menu could not be updated.")
             store = Store(self.config.database_path)
             self.service = Service(
                 store,

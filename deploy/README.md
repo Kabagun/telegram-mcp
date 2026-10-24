@@ -9,12 +9,16 @@ isolated `app-telegram` account. Do not run the legacy installer against it.
 Use `/usr/local/bin/appsctl status telegram --json` to inspect the approved app.
 The platform's `apply` operation starts/reconciles an approved external manifest;
 it does not expose package installation, a source revision, or a forced restart.
-Installing a new ready-built Python wheel and restarting the isolated runtime
-requires the administrator's approved delivery procedure. Preserve its protected
-credentials, SQLite data and native Bot API installation.
+All deployment actions must originate as `apps` through the approved platform
+API. Package updates need an owner-bound artifact/update operation; until the
+platform exposes it, prepare the ready-built wheel without replacing the isolated
+runtime directly. Do not switch to root or revive the shared user service.
+Preserve protected credentials, SQLite data and the native Bot API installation.
+An `apps`-owned staging directory such as `/home/apps/telegram-mcp-artifacts`
+can hold ready artifacts; `/home/apps/temp` is currently root-owned.
 
 Set the non-secret `PUBLIC_MCP_URL` to the public HTTPS MCP endpoint to include
-it in `/start` and `/help`. Leaving it empty asks users to obtain the address
+it in `/connect`. Leaving it empty asks users to obtain the address
 from the administrator. Never include an authentication token in this URL.
 
 ## Standalone systemd user installation (legacy)

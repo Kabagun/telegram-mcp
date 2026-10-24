@@ -33,6 +33,7 @@ def config(tmp_path):
 class FakeTelegram:
     def __init__(self):
         self.sends = []
+        self.command_menus = []
         self.updates = []
         self.polled = asyncio.Event()
         self.polling_error = False
@@ -42,6 +43,9 @@ class FakeTelegram:
         data = json.loads(request.content)
         if method == "getMe":
             result = {"id": 123456, "is_bot": True, "username": "synthetic_test_bot"}
+        elif method == "setMyCommands":
+            self.command_menus.append(data)
+            result = True
         elif method == "sendMessage":
             self.sends.append(data)
             result = {"message_id": len(self.sends), "chat": {"id": data["chat_id"]}}
@@ -283,6 +287,7 @@ async def test_real_stdio_subprocess_sdk_protocol_without_real_telegram(tmp_path
         "class Bot:\n"
         "    async def get_me(self):\n"
         "        return {'username': 'synthetic_test_bot'}\n"
+        "    async def set_commands(self, commands, *, chat_id=None): pass\n"
         "    async def aclose(self): pass\n"
         "asyncio.run(_stdio(Runtime(Config(\n"
         "    bot_token='123:synthetic', polling_enabled=False,\n"

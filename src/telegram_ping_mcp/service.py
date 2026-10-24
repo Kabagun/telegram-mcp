@@ -5,31 +5,31 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
-from .onboarding import onboarding_text
+from .onboarding import command_menu, intro_text, onboarding_text
 from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 _USERNAME = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
 _COMMAND = re.compile(
-    r"/(start|help|stop|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
+    r"/(start|connect|stop|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
 )
 _MAX_INTEGER = 2**63 - 1
 _FAILED = "Telegram rejected the message."
 _UNKNOWN = "Telegram delivery status is unknown."
 _INACTIVE = "The user has not enabled notifications."
-_INVITATION = (
-    "Для подключения откройте персональную ссылку-приглашение, которую вам выдал администратор."
-)
 _INVALID_LINK = "Ссылка недействительна или устарела. Запросите новое приглашение."
 _LINKED = "Связь подтверждена. Уведомления включены."
 _STARTED = "Уведомления включены."
 _STOPPED = "Уведомления отключены. Чтобы включить их снова, отправьте /start."
 _UNLINKED = "Связь с вашим аккаунтом удалена. Для подключения потребуется новое приглашение."
+_CONNECT = "Для подключения используйте /connect."
+logger = logging.getLogger(__name__)
 _FORWARDED_FIELDS = {
     "forward_origin",
     "forward_date",
@@ -343,6 +343,13 @@ class Service:
             # The command's durable state is already applied. Never retry the reply.
             pass
 
+    async def _refresh_commands(self, telegram_id: int) -> None:
+        linked = self._store.get_user_by_telegram(telegram_id) is not None
+        try:
+            await self._bot.set_commands(command_menu(linked=linked), chat_id=telegram_id)
+        except (TelegramAPIError, TelegramTransportError):
+            logger.warning("Telegram chat command menu could not be updated.")
+
     async def handle_update(self, update: dict[str, Any]) -> None:
         if not isinstance(update, dict) or not isinstance(update.get("message"), dict):
             return
@@ -372,8 +379,9 @@ class Service:
             return
         if token is not None and name != "start":
             return
-        if name == "help":
+        if name == "connect":
             await self._reply(telegram_id, self._onboarding_text, deactivate_on_forbidden=False)
+            await self._refresh_commands(telegram_id)
             return
         if name == "start" and token is not None:
             username = author.get("username")
@@ -392,7 +400,9 @@ class Service:
             if self._store.set_active_by_telegram(telegram_id, True):
                 response = _STARTED
             else:
-                response = _INVITATION
+                response = ""
+        elif self._store.get_user_by_telegram(telegram_id) is None:
+            response = _CONNECT
         elif name == "stop":
             self._store.set_active_by_telegram(telegram_id, False)
             response = _STOPPED
@@ -402,5 +412,9 @@ class Service:
                 self._store.delete_user(user["user_key"])
             response = _UNLINKED
         if name == "start":
-            response += "\n\n" + self._onboarding_text
+            introduction = intro_text(
+                linked=self._store.get_user_by_telegram(telegram_id) is not None
+            )
+            response = f"{response}\n\n{introduction}" if response else introduction
         await self._reply(telegram_id, response)
+        await self._refresh_commands(telegram_id)

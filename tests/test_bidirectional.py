@@ -30,6 +30,8 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
         arguments = json.loads(request.content)
         if method == "getMe":
             result = {"id": 123, "is_bot": True, "username": "synthetic_bot"}
+        elif method == "setMyCommands":
+            result = True
         elif method == "getFile":
             result = {"file_id": "synthetic_file", "file_path": "documents/fixture.txt"}
         elif method in {"sendMessage", "sendDocument"}:

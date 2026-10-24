@@ -18,6 +18,10 @@ class FakeBot:
     def __init__(self, *outcomes):
         self.outcomes = deque(outcomes)
         self.sends = []
+        self.command_menus = []
+
+    async def set_commands(self, commands, *, chat_id=None):
+        self.command_menus.append({"commands": commands, "chat_id": chat_id})
 
     async def send_message(self, chat_id, text, **kwargs):
         self.sends.append({"chat_id": chat_id, "text": text, **kwargs})
@@ -386,7 +390,9 @@ async def test_link_commands_optout_resubscribe_and_unlink_are_safe_and_idempote
     service: Service, bot: FakeBot
 ) -> None:
     await service.handle_update(command("/start"))
-    assert "ссылку-приглашение" in bot.sends[-1]["text"]
+    assert bot.sends[-1]["text"].startswith("AI Connector")
+    assert "/connect" in bot.sends[-1]["text"]
+    assert "ссылку-приглашение" not in bot.sends[-1]["text"]
     token = token_from(service.create_user_link("synthetic", "Synthetic"))
     await service.handle_update(command(f"/start@SYNTHETIC_BOT {token}"))
     assert service.get_user("synthetic")["telegram_user_id"] == 7001

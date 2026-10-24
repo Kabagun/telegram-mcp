@@ -15,6 +15,7 @@ from .config import DEFAULT_API_BASE_URL, MAX_ATTACHMENT_BYTES, normalize_api_ba
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _FILE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\Z")
 _SEND_FILE_ID = re.compile(r"[A-Za-z0-9_-]{1,4096}\Z")
+_BOT_COMMAND = re.compile(r"[a-z0-9_]{1,32}\Z")
 _ATTACHMENT_METHODS = {
     "document": "sendDocument",
     "photo": "sendPhoto",
@@ -167,6 +168,42 @@ class TelegramClient:
         ):
             raise TelegramAPIError(502)
         return result
+
+    async def set_commands(
+        self, commands: list[dict[str, str]], *, chat_id: int | None = None
+    ) -> None:
+        """Replace the default menu or one private chat's menu in a single attempt."""
+        if not isinstance(commands, list) or len(commands) > 100:
+            raise ValueError("Telegram command list is invalid.")
+        seen: set[str] = set()
+        for entry in commands:
+            if not isinstance(entry, dict) or set(entry) != {"command", "description"}:
+                raise ValueError("Telegram command list is invalid.")
+            command, description = entry["command"], entry["description"]
+            if (
+                not isinstance(command, str)
+                or _BOT_COMMAND.fullmatch(command) is None
+                or command in seen
+                or not isinstance(description, str)
+                or not description.strip()
+                or len(description) > 256
+                or any(
+                    unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+                    for character in description
+                )
+            ):
+                raise ValueError("Telegram command list is invalid.")
+            if len(description.encode("utf-16-le")) // 2 > 256:
+                raise ValueError("Telegram command list is invalid.")
+            seen.add(command)
+        scope: dict[str, Any] = {"type": "default"}
+        if chat_id is not None:
+            if not _is_int(chat_id) or not 1 <= chat_id <= 2**63 - 1:
+                raise ValueError("Telegram command chat identifier is invalid.")
+            scope = {"type": "chat", "chat_id": chat_id}
+        result = await self._call("setMyCommands", {"commands": commands, "scope": scope})
+        if result is not True:
+            raise TelegramAPIError(502)
 
     async def send_message(
         self,
