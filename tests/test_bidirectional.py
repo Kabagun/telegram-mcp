@@ -32,7 +32,7 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
             result = {"id": 123, "is_bot": True, "username": "synthetic_bot"}
         elif method == "getFile":
             result = {"file_id": "synthetic_file", "file_path": "documents/fixture.txt"}
-        elif method == "sendMessage":
+        elif method in {"sendMessage", "sendDocument"}:
             sent.append(arguments)
             result = {"message_id": len(sent), "chat": {"id": arguments["chat_id"]}}
         else:
@@ -108,6 +108,7 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
                         assert download.content == b"Synthetic document content"
                         assert download.headers["cache-control"] == "no-store"
                         assert download.headers["content-disposition"].startswith("attachment;")
+                        assert download.headers["x-accel-buffering"] == "no"
                         assert (
                             await http.get(path, headers={"Host": "attacker.invalid"})
                         ).status_code == 421
@@ -150,6 +151,21 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
                         )
                         assert sent[-1]["chat_id"] == -100123
                         assert sent[-1]["message_thread_id"] == 17
+                        file_args = {
+                            "message_id": item["id"],
+                            "caption": "Original file received",
+                            "request_id": "file-reply-1",
+                        }
+                        file_result = payload(
+                            await session.call_tool("reply_attachment", file_args)
+                        )
+                        assert file_result["status"] == "sent"
+                        assert sent[-1]["document"] == "synthetic_file"
+                        assert sent[-1]["chat_id"] == 7001
+                        assert sent[-1]["reply_parameters"]["message_id"] == 15
+                        assert payload(await session.call_tool("reply_attachment", file_args))[
+                            "duplicate"
+                        ]
                         store.set_active_by_telegram(7001, False)
                         assert (
                             await session.call_tool(
@@ -161,7 +177,12 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
                                 "reply_message", {**args, "request_id": "reply-disabled"}
                             )
                         ).isError
-                        assert len(sent) == 2
+                        assert (
+                            await session.call_tool(
+                                "reply_attachment", {**file_args, "request_id": "file-disabled"}
+                            )
+                        ).isError
+                        assert len(sent) == 3
 
 
 def test_images_and_binary_content_retain_bytes():

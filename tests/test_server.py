@@ -132,6 +132,7 @@ async def test_real_sdk_http_end_to_end_auth_link_send_dedup_optout_group(config
                             "get_message",
                             "get_attachment",
                             "reply_message",
+                            "reply_attachment",
                             "mark_read",
                         }
                         invitation = structured(
@@ -206,7 +207,7 @@ async def test_official_memory_transport_tools(config):
         runtime = Runtime(config, bot=TelegramClient(TOKEN, client=client))
         async with runtime.lifespan():
             async with create_connected_server_and_client_session(create_mcp(runtime)) as session:
-                assert len((await session.list_tools()).tools) == 11
+                assert len((await session.list_tools()).tools) == 12
                 assert not (await session.call_tool("find_users", {})).isError
 
 
@@ -292,7 +293,7 @@ async def test_real_stdio_subprocess_sdk_protocol_without_real_telegram(tmp_path
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
             assert (await session.initialize()).serverInfo.name == "Telegram Ping MCP"
-            assert len((await session.list_tools()).tools) == 11
+            assert len((await session.list_tools()).tools) == 12
             assert structured(await session.call_tool("find_users", {})) == []
 
 

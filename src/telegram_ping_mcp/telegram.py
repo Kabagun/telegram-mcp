@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import stat
+import unicodedata
 from pathlib import Path
 from typing import Any, Self
 
@@ -13,6 +14,16 @@ from .config import DEFAULT_API_BASE_URL, MAX_ATTACHMENT_BYTES, normalize_api_ba
 
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _FILE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\Z")
+_SEND_FILE_ID = re.compile(r"[A-Za-z0-9_-]{1,4096}\Z")
+_ATTACHMENT_METHODS = {
+    "document": "sendDocument",
+    "photo": "sendPhoto",
+    "audio": "sendAudio",
+    "video": "sendVideo",
+    "voice": "sendVoice",
+    "animation": "sendAnimation",
+}
+_SEND_METHODS = frozenset({"sendMessage", *_ATTACHMENT_METHODS.values()})
 
 
 class TelegramFileError(ValueError):
@@ -129,7 +140,7 @@ class TelegramClient:
 
         http_success = 200 <= response.status_code < 300
         if not isinstance(body, dict) or not isinstance(body.get("ok"), bool):
-            if http_success and method == "sendMessage":
+            if http_success and method in _SEND_METHODS:
                 raise TelegramTransportError()
             raise TelegramAPIError(response.status_code if not http_success else 502)
         if not http_success or not body["ok"]:
@@ -142,7 +153,7 @@ class TelegramClient:
                 retry_after = None
             raise TelegramAPIError(code, retry_after)
         if "result" not in body:
-            if method == "sendMessage":
+            if method in _SEND_METHODS:
                 raise TelegramTransportError()
             raise TelegramAPIError(502)
         return body["result"]
@@ -217,6 +228,61 @@ class TelegramClient:
             )
         ):
             raise TelegramAPIError(502)
+        return result
+
+    async def send_attachment(
+        self,
+        chat_id: int,
+        kind: str,
+        file_id: str,
+        *,
+        caption: str = "",
+        message_thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Resend one known Telegram file ID using its original media type.
+
+        URLs, local paths and uploads are deliberately not supported. Captions
+        are plain text, and a missing reply target must cause Telegram to reject.
+        """
+        if not _is_int(chat_id) or not -(2**63 - 1) <= chat_id <= 2**63 - 1 or chat_id == 0:
+            raise ValueError("Telegram chat identifier is invalid.")
+        if not isinstance(kind, str) or kind not in _ATTACHMENT_METHODS:
+            raise ValueError("Telegram attachment type is invalid.")
+        if not isinstance(file_id, str) or _SEND_FILE_ID.fullmatch(file_id) is None:
+            raise ValueError("Telegram file identifier is invalid.")
+        if not isinstance(caption, str) or len(caption) > 1024:
+            raise ValueError("Telegram caption is invalid or exceeds the allowed length.")
+        for character in caption:
+            category = unicodedata.category(character)
+            if category == "Cs" or (category == "Cc" and character not in "\n\t"):
+                raise ValueError("Telegram caption contains unsupported characters.")
+        if len(caption.encode("utf-16-le")) // 2 > 1024:
+            raise ValueError("Telegram caption exceeds the allowed length.")
+        payload: dict[str, Any] = {"chat_id": chat_id, kind: file_id, "caption": caption}
+        if message_thread_id is not None:
+            if not _is_int(message_thread_id) or not 1 <= message_thread_id <= 2**63 - 1:
+                raise ValueError("Telegram topic identifier is invalid.")
+            if chat_id > 0:
+                raise ValueError("Telegram topic requires a group chat.")
+            payload["message_thread_id"] = message_thread_id
+        if reply_to_message_id is not None:
+            if not _is_int(reply_to_message_id) or not 1 <= reply_to_message_id <= 2**63 - 1:
+                raise ValueError("Reply message identifier is invalid.")
+            payload["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": False,
+            }
+        result = await self._call(_ATTACHMENT_METHODS[kind], payload)
+        if (
+            not isinstance(result, dict)
+            or not _is_int(result.get("message_id"))
+            or not 1 <= result["message_id"] <= 2**63 - 1
+            or not isinstance(result.get("chat"), dict)
+            or not _is_int(result["chat"].get("id"))
+            or result["chat"]["id"] != chat_id
+        ):
+            raise TelegramTransportError()
         return result
 
     def _valid_download_path(self, value: object) -> bool:

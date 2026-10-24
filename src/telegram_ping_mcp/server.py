@@ -316,6 +316,21 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             raise ValueError("Incoming message does not exist.")
         return await runtime.require_service().reply_message(message, text, request_id)
 
+    @mcp.tool()
+    async def reply_attachment(
+        message_id: int, request_id: str, caption: str = ""
+    ) -> dict[str, Any]:
+        """Send an incoming file back to its original Telegram chat, reply target and topic.
+
+        Only the exact attachment on this inbox message is sent. The original sender
+        must remain linked and active. Reuse request_id to avoid duplicate sends.
+        This does not upload files from the AI client's filesystem.
+        """
+        runtime.require_service()
+        if runtime.inbound is None:
+            raise ValueError("Telegram inbox is not ready.")
+        return await runtime.inbound.reply_attachment(message_id, caption, request_id)
+
     return mcp
 
 
@@ -354,6 +369,7 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
                 + quote(item["name"], safe=""),
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
+                "X-Accel-Buffering": "no",
                 "Content-Security-Policy": "sandbox; default-src 'none'",
             },
         )

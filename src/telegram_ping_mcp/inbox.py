@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import secrets
 import sqlite3
@@ -13,12 +15,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import MAX_ATTACHMENT_BYTES
-from .service import ServiceError
+from .service import Service, ServiceError, _safe_text, _utf16_length
 from .store import Store
 from .telegram import (
     TELEGRAM_MAX_FILE_BYTES,
+    TelegramAPIError,
     TelegramClient,
     TelegramFileError,
+    TelegramTransportError,
 )
 
 _MAX_INTEGER = 2**63 - 1
@@ -69,6 +73,9 @@ _MIME = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+\Z")
 _ATTACHMENT_ID = re.compile(r"[A-Za-z0-9_-]{32}\Z")
 _FILE_UNAVAILABLE = "Attachment is unavailable for this verified user or chat."
 _FILE_FAILED = "Telegram attachment could not be downloaded."
+_REPLY_FAILED = "Telegram rejected the message."
+_REPLY_UNKNOWN = "Telegram delivery status is unknown."
+_REPLY_FILE_FAILED = "Telegram attachment metadata is unavailable."
 
 
 def _integer(value: object, *, minimum: int = 1, maximum: int = _MAX_INTEGER) -> int:
@@ -297,6 +304,15 @@ class InboxStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def _get_attachment_message(self, message_id: int) -> dict[str, Any] | None:
+        _integer(message_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM inbound_messages WHERE id = ? AND attachment_id IS NOT NULL",
+                (message_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
 
 class InboundController:
     """Ingest only ordinary messages from currently verified, active human users."""
@@ -428,6 +444,116 @@ class InboundController:
                 item["chat_id"] == item["telegram_user_id"]
                 or item["chat_id"] in self._allowed_group_chat_ids
             )
+        )
+
+    async def reply_attachment(
+        self, message_id: int, caption: str, request_id: str
+    ) -> dict[str, Any]:
+        """Resend the exact accepted incoming file to its original chat and topic."""
+        item = self._inbox._get_attachment_message(message_id)
+        if item is None or not self._attachment_authorized(item):
+            raise ServiceError(_FILE_UNAVAILABLE)
+        caption = _safe_text(caption, maximum=1024, multiline=True, allow_blank=True)
+        if _utf16_length(caption) > 1024:
+            raise ServiceError("Caption exceeds the allowed length.")
+        request_id = _safe_text(request_id, maximum=128)
+        telegram_id = _integer(item["telegram_user_id"])
+        chat_id = _integer(item["chat_id"], minimum=-_MAX_INTEGER)
+        if chat_id != telegram_id and (chat_id >= 0 or chat_id not in self._allowed_group_chat_ids):
+            raise ServiceError(_FILE_UNAVAILABLE)
+        reply_id = _integer(item["telegram_message_id"])
+        topic_id = item["topic_id"]
+        if topic_id is not None:
+            _integer(topic_id)
+            if chat_id > 0:
+                raise ServiceError(_FILE_UNAVAILABLE)
+        kind = item["attachment_kind"]
+        file_id = _file_id(item["telegram_file_id"])
+        if kind not in _ATTACHMENT_KINDS or re.fullmatch(r"[A-Za-z0-9_-]+", file_id) is None:
+            raise ServiceError("Attachment metadata is invalid.")
+        max_bytes = min(self.max_attachment_bytes, self._bot_file_limit())
+        size = item["attachment_size"]
+        if size is None:
+            try:
+                metadata = await self._bot.get_file(file_id)
+                if not isinstance(metadata, dict) or metadata.get("file_id") != file_id:
+                    raise ServiceError(_REPLY_FILE_FAILED)
+                size = _integer(metadata.get("file_size"), minimum=0)
+            except Exception:
+                raise ServiceError(_REPLY_FILE_FAILED) from None
+            if not self._attachment_authorized(item):
+                raise ServiceError(_FILE_UNAVAILABLE)
+        else:
+            _integer(size, minimum=0)
+        if size > max_bytes:
+            if size > TELEGRAM_MAX_FILE_BYTES and self._bot_file_limit() <= TELEGRAM_MAX_FILE_BYTES:
+                raise ServiceError(
+                    "Files above 20 MiB require a configured local Telegram Bot API server."
+                )
+            raise ServiceError("Attachment exceeds the allowed send size.")
+        fingerprint = Service._fingerprint(
+            "attachment_reply",
+            chat_id,
+            [item],
+            json.dumps(
+                {"message_id": message_id, "kind": kind, "file_id": file_id, "caption": caption},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            topic_id,
+            reply_id,
+        )
+        try:
+            delivery = self._store.reserve_delivery(request_id, fingerprint)
+        except ValueError:
+            raise ServiceError("Request ID was already used for a different delivery.") from None
+        if not delivery["is_new"]:
+            return Service._result(request_id, delivery, duplicate=True)
+        # Recheck immediately before sending, including after metadata resolution.
+        if not self._attachment_authorized(item):
+            self._store.finish_delivery(request_id, "failed", error=_FILE_UNAVAILABLE)
+            raise ServiceError(_FILE_UNAVAILABLE)
+        try:
+            message = await self._bot.send_attachment(
+                chat_id,
+                kind,
+                file_id,
+                caption=caption,
+                message_thread_id=topic_id,
+                reply_to_message_id=reply_id,
+            )
+        except TelegramAPIError as error:
+            self._store.finish_delivery(request_id, "failed", error=_REPLY_FAILED)
+            if chat_id > 0 and error.code == 403:
+                self._store.set_active_by_telegram(telegram_id, False)
+            return Service._result(
+                request_id, {"status": "failed", "error": _REPLY_FAILED}, duplicate=False
+            )
+        except TelegramTransportError:
+            self._store.finish_delivery(request_id, "unknown", error=_REPLY_UNKNOWN)
+            return Service._result(
+                request_id, {"status": "unknown", "error": _REPLY_UNKNOWN}, duplicate=False
+            )
+        except asyncio.CancelledError:
+            self._store.finish_delivery(request_id, "unknown", error=_REPLY_UNKNOWN)
+            raise
+        except Exception:
+            self._store.finish_delivery(request_id, "unknown", error=_REPLY_UNKNOWN)
+            raise ServiceError(_REPLY_UNKNOWN) from None
+        if (
+            not isinstance(message, dict)
+            or isinstance(message.get("message_id"), bool)
+            or not isinstance(message.get("message_id"), int)
+            or not 1 <= message["message_id"] <= _MAX_INTEGER
+        ):
+            self._store.finish_delivery(request_id, "unknown", error=_REPLY_UNKNOWN)
+            return Service._result(
+                request_id, {"status": "unknown", "error": _REPLY_UNKNOWN}, duplicate=False
+            )
+        self._store.finish_delivery(request_id, "sent", message_id=message["message_id"])
+        return Service._result(
+            request_id, {"status": "sent", "message_id": message["message_id"]}, duplicate=False
         )
 
     async def read_attachment(
