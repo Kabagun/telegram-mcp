@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .config import MAX_ATTACHMENT_BYTES
 from .service import ServiceError
 from .store import Store
 from .telegram import (
@@ -21,7 +22,7 @@ from .telegram import (
 )
 
 _MAX_INTEGER = 2**63 - 1
-_DEFAULT_FILE_LIMIT = 10 * 1024 * 1024
+_DEFAULT_FILE_LIMIT = MAX_ATTACHMENT_BYTES
 _ATTACHMENT_KINDS = {"document", "photo", "audio", "video", "voice", "animation"}
 _UNTRUSTED_FIELDS = {
     "forward_origin",
@@ -307,6 +308,7 @@ class InboundController:
         bot: TelegramClient,
         *,
         allowed_group_chat_ids: frozenset[int] = frozenset(),
+        max_attachment_bytes: int = _DEFAULT_FILE_LIMIT,
     ) -> None:
         if store.path.resolve() != inbox.path.resolve():
             raise ValueError("Inbound messages must use the verified users database.")
@@ -314,6 +316,7 @@ class InboundController:
         self._inbox = inbox
         self._bot = bot
         self._allowed_group_chat_ids = allowed_group_chat_ids
+        self.max_attachment_bytes = _integer(max_attachment_bytes, maximum=MAX_ATTACHMENT_BYTES)
 
     @staticmethod
     def _attachment(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -431,25 +434,27 @@ class InboundController:
         self,
         attachment_id: str,
         *,
-        max_bytes: int = _DEFAULT_FILE_LIMIT,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
-        _integer(max_bytes, maximum=TELEGRAM_MAX_FILE_BYTES)
+        requested_limit = self.max_attachment_bytes if max_bytes is None else max_bytes
+        _integer(requested_limit, maximum=self.max_attachment_bytes)
+        max_bytes = min(requested_limit, self._bot_file_limit())
         item = self._inbox._get_attachment(attachment_id)
         if item is None or not self._attachment_authorized(item):
             raise ServiceError(_FILE_UNAVAILABLE)
         if item["attachment_size"] is not None and item["attachment_size"] > max_bytes:
-            raise ServiceError("Attachment exceeds the allowed download size.")
+            self._raise_file_limit(item["attachment_size"])
         try:
             metadata = await self._bot.get_file(item["telegram_file_id"])
             size = metadata.get("file_size")
             if size is not None and _integer(size, minimum=0) > max_bytes:
-                raise TelegramFileError()
+                self._raise_file_limit(size)
             # Recheck after the network operation in case /stop or unlink was processed.
             if not self._attachment_authorized(item):
                 raise ServiceError(_FILE_UNAVAILABLE)
             data = await self._bot.download_file(metadata["file_path"], max_bytes=max_bytes)
         except TelegramFileError:
-            raise ServiceError("Attachment exceeds the allowed download size.") from None
+            self._raise_file_limit(max_bytes + 1)
         except ServiceError:
             raise
         except Exception:
@@ -467,4 +472,34 @@ class InboundController:
             "mime_type": item["attachment_mime_type"],
             "name": item["attachment_name"],
             "size": len(data),
+        }
+
+    def _bot_file_limit(self) -> int:
+        limit = getattr(self._bot, "max_file_bytes", TELEGRAM_MAX_FILE_BYTES)
+        return _integer(limit, maximum=MAX_ATTACHMENT_BYTES)
+
+    def _raise_file_limit(self, size: int) -> None:
+        if size > TELEGRAM_MAX_FILE_BYTES and self._bot_file_limit() <= TELEGRAM_MAX_FILE_BYTES:
+            raise ServiceError(
+                "Files above 20 MiB require a configured local Telegram Bot API server."
+            ) from None
+        raise ServiceError("Attachment exceeds the allowed download size.") from None
+
+    def attachment_info(self, attachment_id: str) -> dict[str, Any]:
+        """Describe an authorized attachment without resolving or downloading its file."""
+        item = self._inbox._get_attachment(attachment_id)
+        if item is None or not self._attachment_authorized(item):
+            raise ServiceError(_FILE_UNAVAILABLE)
+        size = item["attachment_size"]
+        return {
+            "attachment_id": attachment_id,
+            "message_id": item["id"],
+            "name": item["attachment_name"],
+            "mime_type": item["attachment_mime_type"],
+            "size": size,
+            "max_download_bytes": min(self.max_attachment_bytes, self._bot_file_limit()),
+            "requires_local_bot_api": size is not None
+            and size > TELEGRAM_MAX_FILE_BYTES
+            and self._bot_file_limit() <= TELEGRAM_MAX_FILE_BYTES,
+            "download_path": f"/attachments/{attachment_id}",
         }

@@ -8,10 +8,13 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_DATABASE_PATH = Path("data/telegram-ping.sqlite3")
 DEFAULT_LINK_TTL_SECONDS = 900
 DEFAULT_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
+DEFAULT_API_BASE_URL = "https://api.telegram.org"
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _BOT_ID = re.compile(r"[0-9]+\Z")
@@ -21,6 +24,64 @@ _DECIMAL_INTEGER = re.compile(r"[0-9]+\Z")
 
 class ConfigError(ValueError):
     """A safe configuration error that never includes environment values."""
+
+
+def normalize_api_base_url(value: str) -> str:
+    """Permit Telegram's cloud endpoint or an explicitly configured loopback API."""
+    error = "TELEGRAM_API_BASE_URL must be the Telegram cloud URL or loopback HTTP."
+    if not isinstance(value, str) or any(char.isspace() for char in value):
+        raise ConfigError(error)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError:
+        raise ConfigError(error) from None
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or not hostname
+        or "%" in hostname
+    ):
+        raise ConfigError(error)
+    if parsed.scheme == "https" and hostname == "api.telegram.org" and port in {None, 443}:
+        return DEFAULT_API_BASE_URL
+    if parsed.scheme != "http" or (port is not None and not 1 <= port <= 65535):
+        raise ConfigError(error)
+    if hostname.lower() == "localhost":
+        hostname = "127.0.0.1"  # Resolve no operator-controlled DNS names for local API access.
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        raise ConfigError(error) from None
+    if not address.is_loopback:
+        raise ConfigError(error)
+    host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"http://{host}" + (f":{port}" if port is not None else "")
+
+
+def _parse_attachment_limit(value: str) -> int:
+    if not value:
+        return MAX_ATTACHMENT_BYTES
+    if len(value) > 9 or _DECIMAL_INTEGER.fullmatch(value) is None:
+        raise ConfigError("MAX_ATTACHMENT_BYTES must be between 1 and 104857600.")
+    result = int(value)
+    if not 1 <= result <= MAX_ATTACHMENT_BYTES:
+        raise ConfigError("MAX_ATTACHMENT_BYTES must be between 1 and 104857600.")
+    return result
+
+
+def _parse_local_files_root(value: str, api_base_url: str) -> Path | None:
+    if not value:
+        return None
+    if "\x00" in value or not Path(value).is_absolute():
+        raise ConfigError("TELEGRAM_LOCAL_FILES_ROOT must be an absolute directory path.")
+    if api_base_url == DEFAULT_API_BASE_URL:
+        raise ConfigError("TELEGRAM_LOCAL_FILES_ROOT requires a local Bot API endpoint.")
+    return Path(value)
 
 
 def _setting(environ: Mapping[str, str], name: str, default: str = "") -> str:
@@ -179,6 +240,9 @@ class Config:
     allowed_group_chat_ids: frozenset[int] = frozenset()
     allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
     polling_enabled: bool = True
+    api_base_url: str = DEFAULT_API_BASE_URL
+    local_files_root: Path | None = None
+    max_attachment_bytes: int = MAX_ATTACHMENT_BYTES
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -192,6 +256,9 @@ class Config:
         if "\x00" in database_value:
             raise ConfigError("DATABASE_PATH must be a valid filesystem path.")
         database_path = Path(database_value) if database_value else DEFAULT_DATABASE_PATH
+        api_base_url = normalize_api_base_url(
+            _setting(source, "TELEGRAM_API_BASE_URL", DEFAULT_API_BASE_URL)
+        )
 
         return cls(
             bot_token=bot_token,
@@ -203,6 +270,11 @@ class Config:
             ),
             allowed_hosts=_parse_allowed_hosts(_setting(source, "MCP_ALLOWED_HOSTS")),
             polling_enabled=_parse_polling_enabled(_setting(source, "POLLING_ENABLED", "true")),
+            api_base_url=api_base_url,
+            local_files_root=_parse_local_files_root(
+                _setting(source, "TELEGRAM_LOCAL_FILES_ROOT"), api_base_url
+            ),
+            max_attachment_bytes=_parse_attachment_limit(_setting(source, "MAX_ATTACHMENT_BYTES")),
         )
 
     def validate_for_serve(self, transport: str, host: str) -> None:
@@ -210,6 +282,14 @@ class Config:
 
         if not self.bot_token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required to serve.")
+        normalized_api = normalize_api_base_url(self.api_base_url)
+        _parse_local_files_root(str(self.local_files_root or ""), normalized_api)
+        if (
+            isinstance(self.max_attachment_bytes, bool)
+            or not isinstance(self.max_attachment_bytes, int)
+            or not 1 <= self.max_attachment_bytes <= MAX_ATTACHMENT_BYTES
+        ):
+            raise ConfigError("MAX_ATTACHMENT_BYTES must be between 1 and 104857600.")
         if transport not in {"stdio", "http"}:
             raise ConfigError("Transport must be either 'stdio' or 'http'.")
         if not isinstance(host, str):

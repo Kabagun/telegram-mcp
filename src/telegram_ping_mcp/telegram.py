@@ -1,9 +1,15 @@
 """Small Telegram Bot API client with safe, content-free exceptions."""
 
+import asyncio
+import os
 import re
+import stat
+from pathlib import Path
 from typing import Any, Self
 
 import httpx
+
+from .config import DEFAULT_API_BASE_URL, MAX_ATTACHMENT_BYTES, normalize_api_base_url
 
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _FILE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\Z")
@@ -58,13 +64,37 @@ def _is_int(value: object) -> bool:
 class TelegramClient:
     """Bot-only API calls. Injected HTTP clients remain owned by the caller."""
 
-    def __init__(self, token: str, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        api_base_url: str = DEFAULT_API_BASE_URL,
+        local_files_root: Path | None = None,
+    ) -> None:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("A Telegram bot token is required.")
-        self._base_url = f"https://api.telegram.org/bot{token}"
-        self._file_base_url = f"https://api.telegram.org/file/bot{token}"
+        api_base_url = normalize_api_base_url(api_base_url)
+        self.is_local_api = api_base_url != DEFAULT_API_BASE_URL
+        self.max_file_bytes = MAX_ATTACHMENT_BYTES if self.is_local_api else TELEGRAM_MAX_FILE_BYTES
+        self._local_files_root: Path | None = None
+        if local_files_root is not None:
+            if not self.is_local_api or not Path(local_files_root).is_absolute():
+                raise ValueError("Local Telegram files require an absolute root and local Bot API.")
+            try:
+                root = Path(local_files_root).resolve(strict=True)
+                valid_root = root.is_dir()
+            except (OSError, RuntimeError, ValueError):
+                valid_root = False
+            if not valid_root:
+                raise ValueError("Local Telegram file root is unavailable.")
+            self._local_files_root = root
+        self._base_url = f"{api_base_url}/bot{token}"
+        self._file_base_url = f"{api_base_url}/file/bot{token}"
         self._owns_client = client is None
-        self._client = client if client is not None else httpx.AsyncClient()
+        self._client = (
+            client if client is not None else httpx.AsyncClient(trust_env=not self.is_local_api)
+        )
 
     async def __aenter__(self) -> Self:
         return self
@@ -180,7 +210,7 @@ class TelegramClient:
             not isinstance(result, dict)
             or not isinstance(result.get("file_id"), str)
             or not result["file_id"]
-            or not _valid_file_path(result.get("file_path"))
+            or not self._valid_download_path(result.get("file_path"))
             or (
                 "file_size" in result
                 and (not _is_int(result["file_size"]) or result["file_size"] < 0)
@@ -189,12 +219,70 @@ class TelegramClient:
             raise TelegramAPIError(502)
         return result
 
+    def _valid_download_path(self, value: object) -> bool:
+        if _valid_file_path(value):
+            return True
+        return (
+            self._local_files_root is not None
+            and isinstance(value, str)
+            and len(value) <= 4096
+            and "\x00" not in value
+            and Path(value).is_absolute()
+            and ".." not in Path(value).parts
+        )
+
+    def _read_local_file(self, file_path: str, max_bytes: int) -> bytes:
+        """Resolve and verify the opened file before reading bounded chunks in a worker thread."""
+        failed = False
+        descriptor: int | None = None
+        try:
+            root = self._local_files_root
+            resolved = Path(file_path).resolve(strict=True)
+            if root is None or not resolved.is_relative_to(root) or not resolved.is_file():
+                raise TelegramAPIError(502)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(resolved, flags)
+            opened = os.fstat(descriptor)
+            # Re-resolve after opening, then match the path's identity to the
+            # descriptor. This also detects an intermediate directory swap.
+            checked = resolved.resolve(strict=True)
+            checked_stat = checked.stat()
+            if (
+                not checked.is_relative_to(root)
+                or not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (checked_stat.st_dev, checked_stat.st_ino)
+            ):
+                raise TelegramAPIError(502)
+            if opened.st_size > max_bytes:
+                raise TelegramFileError()
+            content = bytearray()
+            while True:
+                chunk = os.read(descriptor, min(64 * 1024, max_bytes - len(content) + 1))
+                if not chunk:
+                    return bytes(content)
+                if len(content) + len(chunk) > max_bytes:
+                    raise TelegramFileError()
+                content.extend(chunk)
+        except (OSError, RuntimeError, ValueError) as error:
+            if isinstance(error, TelegramFileError):
+                raise
+            failed = True
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if failed:
+            raise TelegramAPIError(502)
+        raise TelegramAPIError(502)
+
     async def download_file(self, file_path: str, *, max_bytes: int = 10 * 1024 * 1024) -> bytes:
         """Read a bounded file stream from Telegram; never follow redirects or write to disk."""
-        if not _valid_file_path(file_path):
+        if not self._valid_download_path(file_path):
             raise ValueError("Telegram file path is invalid.")
-        if not _is_int(max_bytes) or not 1 <= max_bytes <= TELEGRAM_MAX_FILE_BYTES:
+        if not _is_int(max_bytes) or not 1 <= max_bytes <= self.max_file_bytes:
             raise ValueError("Telegram download limit is invalid.")
+        if self._local_files_root is not None and Path(file_path).is_absolute():
+            return await asyncio.to_thread(self._read_local_file, file_path, max_bytes)
         failed_transport = False
         try:
             async with self._client.stream(

@@ -1,0 +1,17 @@
+[Unit]
+Description=Local Telegram Bot API for large attachments
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/telegram-ping-mcp/bot-api
+EnvironmentFile=%h/.config/telegram-ping-mcp/bot-api.env
+ExecStart=%h/Programs/telegram-bot-api/bin/telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=18008 --dir=/srv/apps/telegram-ping-mcp/bot-api --temp-dir=/srv/apps/telegram-ping-mcp/bot-api-temp --verbosity=0 --memory-verbosity=0
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

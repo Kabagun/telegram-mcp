@@ -1,9 +1,12 @@
 import json
+import os
 import traceback
+from pathlib import Path
 
 import httpx
 import pytest
 
+from telegram_ping_mcp.config import MAX_ATTACHMENT_BYTES
 from telegram_ping_mcp.telegram import (
     TELEGRAM_MAX_FILE_BYTES,
     TelegramAPIError,
@@ -458,3 +461,187 @@ async def test_download_stops_on_an_unreasonably_large_declared_length():
             await bot.download_file("documents/file.txt")
     assert stream.reads == 0
     assert stream.closed is True
+
+
+async def test_local_api_routes_requests_only_to_configured_loopback():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": {"id": 1, "is_bot": True}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bot = TelegramClient(TOKEN, client=client, api_base_url="http://localhost:8081/")
+        assert bot.is_local_api is True
+        assert bot.max_file_bytes == MAX_ATTACHMENT_BYTES
+        await bot.get_me()
+    assert str(calls[0].url) == f"http://127.0.0.1:8081/bot{TOKEN}/getMe"
+
+
+async def test_local_api_can_read_exactly_100_mib_from_confined_local_path(tmp_path):
+    root = tmp_path / "local-bot-data"
+    root.mkdir()
+    file = root / "synthetic.bin"
+    with file.open("wb") as stream:
+        stream.seek(MAX_ATTACHMENT_BYTES - 1)
+        stream.write(b"x")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "result": {
+                    "file_id": "synthetic-file",
+                    "file_path": str(file),
+                    "file_size": MAX_ATTACHMENT_BYTES,
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        bot = TelegramClient(
+            TOKEN, client=client, api_base_url="http://127.0.0.1:8081", local_files_root=root
+        )
+        metadata = await bot.get_file("synthetic-file")
+        content = await bot.download_file(metadata["file_path"], max_bytes=MAX_ATTACHMENT_BYTES)
+    assert len(content) == MAX_ATTACHMENT_BYTES
+    assert content[-1:] == b"x"
+    assert len(calls) == 1  # File bytes came from the shared directory, not an HTTP URL.
+
+
+async def test_local_api_rejects_oversize_file_before_reading(tmp_path):
+    file = tmp_path / "synthetic.bin"
+    file.write_bytes(b"12345")
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=tmp_path)
+    async with bot:
+        with pytest.raises(TelegramFileError):
+            await bot.download_file(str(file), max_bytes=4)
+        with pytest.raises(ValueError, match="download limit"):
+            await bot.download_file(str(file), max_bytes=MAX_ATTACHMENT_BYTES + 1)
+
+
+async def test_local_api_rejects_paths_outside_shared_root_without_exposing_them(tmp_path):
+    root = tmp_path / "local-bot-data"
+    root.mkdir()
+    outside = tmp_path / "synthetic-private-name.bin"
+    outside.write_bytes(b"synthetic private content")
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=root)
+    async with bot:
+        with pytest.raises(TelegramAPIError) as caught:
+            await bot.download_file(str(outside))
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert str(tmp_path) not in rendered
+    assert outside.name not in rendered
+    assert TOKEN not in rendered
+
+
+async def test_local_api_rejects_symlink_escape(tmp_path):
+    root = tmp_path / "local-bot-data"
+    root.mkdir()
+    outside = tmp_path / "synthetic.bin"
+    outside.write_bytes(b"synthetic private content")
+    link = root / "link.bin"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("Creating symlinks is unavailable in this Windows session.")
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=root)
+    async with bot:
+        with pytest.raises(TelegramAPIError):
+            await bot.download_file(str(link))
+
+
+async def test_local_path_is_rechecked_after_open_before_any_bytes_are_read(tmp_path, monkeypatch):
+    root = tmp_path / "local-bot-data"
+    root.mkdir()
+    inside = root / "synthetic.bin"
+    outside = tmp_path / "outside.bin"
+    inside.write_bytes(b"synthetic permitted content")
+    outside.write_bytes(b"synthetic forbidden content")
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=root)
+    original_resolve = Path.resolve
+    resolves = 0
+
+    def simulate_directory_swap(path, *args, **kwargs):
+        nonlocal resolves
+        if path == inside:
+            resolves += 1
+            if resolves == 2:
+                return outside
+        return original_resolve(path, *args, **kwargs)
+
+    def forbidden_read(*_):
+        raise AssertionError("A path escaping the root must be rejected before reading bytes.")
+
+    monkeypatch.setattr(Path, "resolve", simulate_directory_swap)
+    monkeypatch.setattr(os, "read", forbidden_read)
+    async with bot:
+        with pytest.raises(TelegramAPIError):
+            await bot.download_file(str(inside))
+    assert resolves == 2
+
+
+async def test_local_file_growth_is_bounded_even_after_initial_stat(tmp_path, monkeypatch):
+    file = tmp_path / "synthetic.bin"
+    file.write_bytes(b"ab")
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=tmp_path)
+    original_read = os.read
+    grown = False
+
+    def grow_then_read(descriptor, maximum):
+        nonlocal grown
+        if not grown:
+            grown = True
+            with file.open("ab") as stream:
+                stream.write(b"cdef")
+        return original_read(descriptor, maximum)
+
+    monkeypatch.setattr(os, "read", grow_then_read)
+    async with bot:
+        with pytest.raises(TelegramFileError):
+            await bot.download_file(str(file), max_bytes=4)
+    assert grown is True
+
+
+@pytest.mark.parametrize("local_root", [None, "relative/files"])
+async def test_absolute_paths_require_explicit_absolute_local_root(tmp_path, local_root):
+    if local_root is not None:
+        with pytest.raises(ValueError, match="absolute root"):
+            TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081", local_files_root=local_root)
+        return
+    bot = TelegramClient(TOKEN, api_base_url="http://127.0.0.1:8081")
+    async with bot:
+        with pytest.raises(ValueError, match="file path"):
+            await bot.download_file(str(tmp_path / "synthetic.bin"))
+
+
+async def test_local_api_http_stream_cap_is_100_mib_and_redirects_are_not_followed():
+    stream = FileStream([b"never-read"])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"content-length": str(MAX_ATTACHMENT_BYTES + 1)},
+                stream=stream,
+            )
+        )
+    ) as client:
+        bot = TelegramClient(TOKEN, client=client, api_base_url="http://127.0.0.1:8081")
+        with pytest.raises(TelegramFileError):
+            await bot.download_file("documents/file.bin", max_bytes=MAX_ATTACHMENT_BYTES)
+    assert stream.reads == 0
+    assert stream.closed is True
+    calls = []
+
+    def redirect(request):
+        calls.append(request)
+        return httpx.Response(302, headers={"location": "http://192.168.0.1/private"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirect)) as client:
+        bot = TelegramClient(TOKEN, client=client, api_base_url="http://127.0.0.1:8081")
+        with pytest.raises(TelegramAPIError):
+            await bot.download_file("documents/file.bin", max_bytes=MAX_ATTACHMENT_BYTES)
+    assert len(calls) == 1

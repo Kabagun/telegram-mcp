@@ -11,19 +11,20 @@ import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, BinaryIO
+from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .attachments import AttachmentContent, attachment_content
 from .config import Config
 from .inbox import InboundController, InboxStore
 from .polling import Poller
-from .service import Service
+from .service import Service, ServiceError
 from .store import Store
 from .telegram import TelegramClient
 
@@ -82,6 +83,7 @@ class Runtime:
         self.polling_task: asyncio.Task[None] | None = None
         self.stop = asyncio.Event()
         self.started = False
+        self.download_lock = asyncio.Lock()
         self._lock = PollingLock(config.database_path)
 
     @contextlib.asynccontextmanager
@@ -93,7 +95,11 @@ class Runtime:
             if self.config.polling_enabled:
                 self._lock.acquire()
             if self.bot is None:
-                self.bot = TelegramClient(self.config.bot_token)
+                self.bot = TelegramClient(
+                    self.config.bot_token,
+                    api_base_url=self.config.api_base_url,
+                    local_files_root=self.config.local_files_root,
+                )
             me = await self.bot.get_me()
             username = me.get("username")
             if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
@@ -112,6 +118,7 @@ class Runtime:
                 self.inbox,
                 self.bot,
                 allowed_group_chat_ids=self.config.allowed_group_chat_ids,
+                max_attachment_bytes=self.config.max_attachment_bytes,
             )
             if self.config.polling_enabled:
                 poller = Poller(self.bot, store, self.handle_update)
@@ -283,7 +290,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
 
     @mcp.tool(structured_output=False)
     async def get_attachment(attachment_id: str) -> list[AttachmentContent]:
-        """Fetch an incoming file, up to 10 MiB, as actual MCP content, with an UTF-8 text preview.
+        """Read an attachment. Small files return inline content, large files an authenticated path.
 
         Images return image content; other files return an embedded binary resource.
         Binary document parsing depends on the client's supported file types.
@@ -292,7 +299,11 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         runtime.require_service()
         if runtime.inbound is None:
             raise ValueError("Telegram inbox is not ready.")
-        return attachment_content(await runtime.inbound.read_attachment(attachment_id))
+        metadata = runtime.inbound.attachment_info(attachment_id)
+        if metadata["size"] is None or metadata["size"] > 10 * 1024 * 1024:
+            return attachment_content(metadata)
+        async with runtime.download_lock:
+            return attachment_content(await runtime.inbound.read_attachment(attachment_id))
 
     @mcp.tool()
     async def reply_message(message_id: int, text: str, request_id: str) -> dict[str, Any]:
@@ -319,6 +330,32 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
             state,
             status_code=200 if state["status"] == "ready" else 503,
             headers={"Cache-Control": "no-store"},
+        )
+
+    @mcp.custom_route("/attachments/{attachment_id}", methods=["GET"])
+    async def download_attachment(request: Request) -> Response:
+        rejected = await TransportSecurityMiddleware(
+            mcp.settings.transport_security
+        ).validate_request(request)
+        if rejected is not None:
+            return rejected
+        if runtime.readiness()["status"] != "ready" or runtime.inbound is None:
+            return JSONResponse({"error": "Telegram inbox is not ready."}, status_code=503)
+        try:
+            async with runtime.download_lock:
+                item = await runtime.inbound.read_attachment(request.path_params["attachment_id"])
+        except ServiceError as error:
+            return JSONResponse({"error": str(error)}, status_code=400)
+        return Response(
+            item["data"],
+            media_type=item["mime_type"],
+            headers={
+                "Content-Disposition": "attachment; filename*=UTF-8''"
+                + quote(item["name"], safe=""),
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+            },
         )
 
     app = mcp.streamable_http_app()

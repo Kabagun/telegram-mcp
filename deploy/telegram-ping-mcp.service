@@ -11,7 +11,7 @@ WorkingDirectory=/srv/apps/telegram-ping-mcp/app
 EnvironmentFile=%h/.config/telegram-ping-mcp/server.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/srv/apps/telegram-ping-mcp/app/.venv/bin/telegram-ping-mcp serve --transport http --host 127.0.0.1 --port 18004
+ExecStart=/srv/apps/telegram-ping-mcp/app/.venv/bin/telegram-ping-mcp serve --transport http --host 127.0.0.1 --port 18007
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=35

@@ -5,8 +5,10 @@ import pytest
 
 from telegram_ping_mcp.config import (
     DEFAULT_ALLOWED_HOSTS,
+    DEFAULT_API_BASE_URL,
     DEFAULT_DATABASE_PATH,
     DEFAULT_LINK_TTL_SECONDS,
+    MAX_ATTACHMENT_BYTES,
     Config,
     ConfigError,
 )
@@ -22,6 +24,9 @@ def test_from_env_uses_safe_defaults() -> None:
     assert config.allowed_group_chat_ids == frozenset()
     assert config.allowed_hosts == DEFAULT_ALLOWED_HOSTS
     assert config.polling_enabled is True
+    assert config.api_base_url == DEFAULT_API_BASE_URL
+    assert config.local_files_root is None
+    assert config.max_attachment_bytes == 100 * 1024 * 1024
 
 
 def test_from_env_parses_supported_values() -> None:
@@ -191,3 +196,67 @@ def test_config_is_frozen() -> None:
 
     with pytest.raises(FrozenInstanceError):
         config.bot_token = "123456:replacement-test-token"  # type: ignore[misc]
+
+
+def test_local_api_settings_and_configured_size_limit(tmp_path):
+    config = Config.from_env(
+        {
+            "TELEGRAM_API_BASE_URL": "http://localhost:8081/",
+            "TELEGRAM_LOCAL_FILES_ROOT": str(tmp_path),
+            "MAX_ATTACHMENT_BYTES": str(MAX_ATTACHMENT_BYTES),
+        }
+    )
+    assert config.api_base_url == "http://127.0.0.1:8081"
+    assert config.local_files_root == tmp_path
+    assert config.max_attachment_bytes == MAX_ATTACHMENT_BYTES
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://example.com",
+        "http://example.com",
+        "http://0.0.0.0:8081",
+        "http://192.168.0.1:8081",
+        "http://169.254.169.254",
+        "https://127.0.0.1:8081",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:8081/path",
+        "http://name:secret@127.0.0.1:8081",
+        "http://127.0.0.1?secret=credential",
+        "http://127.0.0.1#secret",
+        "http://127.0.0.1\n",
+        "file:///tmp/bot-api",
+        "http://[::1%25eth0]:8081",
+        "http://127.0.0.1.example.com",
+        "",
+    ],
+)
+def test_api_endpoints_cannot_target_arbitrary_hosts(endpoint):
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env({"TELEGRAM_API_BASE_URL": endpoint})
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("endpoint", ["http://127.0.0.1:8081", "http://[::1]:8081"])
+def test_loopback_ipv4_and_ipv6_api_endpoints_are_supported(endpoint):
+    assert Config.from_env({"TELEGRAM_API_BASE_URL": endpoint}).api_base_url == endpoint
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "104857601", "x", "9" * 5000, "1.5"])
+def test_attachment_limit_is_bounded_before_integer_conversion(limit):
+    with pytest.raises(ConfigError, match="MAX_ATTACHMENT_BYTES"):
+        Config.from_env({"MAX_ATTACHMENT_BYTES": limit})
+
+
+def test_local_files_root_requires_local_endpoint_and_absolute_path(tmp_path):
+    with pytest.raises(ConfigError, match="local Bot API"):
+        Config.from_env({"TELEGRAM_LOCAL_FILES_ROOT": str(tmp_path)})
+    with pytest.raises(ConfigError, match="absolute directory"):
+        Config.from_env(
+            {
+                "TELEGRAM_API_BASE_URL": "http://127.0.0.1:8081",
+                "TELEGRAM_LOCAL_FILES_ROOT": "relative/files",
+            }
+        )

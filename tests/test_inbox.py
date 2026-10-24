@@ -265,7 +265,7 @@ async def test_attachment_metadata_is_public_but_file_id_and_bytes_are_internal(
     }
     assert bot.calls == [
         ("get_file", FILE_ID),
-        ("download_file", "documents/file_1.txt", 10 * 1024 * 1024),
+        ("download_file", "documents/file_1.txt", 20 * 1024 * 1024),
     ]
     with sqlite3.connect(inbox.path) as connection:
         stored = connection.execute("SELECT * FROM inbound_messages").fetchone()
@@ -467,7 +467,7 @@ async def test_malformed_file_metadata_fails_with_safe_error(setup, metadata):
     assert len(bot.calls) == 1
 
 
-@pytest.mark.parametrize("max_bytes", [0, -1, True, "1", 20 * 1024 * 1024 + 1])
+@pytest.mark.parametrize("max_bytes", [0, -1, True, "1", 100 * 1024 * 1024 + 1])
 async def test_file_limit_is_bounded(setup, max_bytes):
     _, _, bot, controller = setup
     with pytest.raises(ServiceError):
@@ -484,3 +484,53 @@ async def test_attachment_handles_are_validated(setup, attachment_id):
 def test_controller_rejects_separate_unverified_database(setup, tmp_path: Path):
     with pytest.raises(ValueError, match="verified users database"):
         InboundController(setup[0], InboxStore(tmp_path / "other.sqlite3"), setup[2])
+
+
+async def test_cloud_large_file_explains_local_api_requirement_before_network(setup):
+    _, inbox, bot, controller = setup
+    await controller.handle_update(document(size=21 * 1024 * 1024))
+    attachment_id = inbox.list_messages()[0]["attachment"]["id"]
+    info = controller.attachment_info(attachment_id)
+    assert info["requires_local_bot_api"] is True
+    assert info["max_download_bytes"] == 20 * 1024 * 1024
+    assert info["download_path"] == f"/attachments/{attachment_id}"
+    assert FILE_ID not in json.dumps(info)
+    with pytest.raises(ServiceError, match="local Telegram Bot API"):
+        await controller.read_attachment(attachment_id)
+    assert bot.calls == []
+
+
+async def test_local_api_uses_configured_100_mib_limit(setup):
+    _, inbox, bot, controller = setup
+    bot.max_file_bytes = 100 * 1024 * 1024
+    await controller.handle_update(document(size=100 * 1024 * 1024))
+    attachment_id = inbox.list_messages()[0]["attachment"]["id"]
+    info = controller.attachment_info(attachment_id)
+    assert info["max_download_bytes"] == 100 * 1024 * 1024
+    assert info["requires_local_bot_api"] is False
+    assert bot.calls == []
+    await controller.read_attachment(attachment_id)
+    assert bot.calls[-1] == ("download_file", "documents/file_1.txt", 100 * 1024 * 1024)
+
+
+async def test_configured_limit_is_enforced_for_local_files(setup):
+    store, inbox, bot, _ = setup
+    bot.max_file_bytes = 100 * 1024 * 1024
+    controller = InboundController(store, inbox, bot, max_attachment_bytes=30)
+    await controller.handle_update(document(size=31))
+    attachment_id = inbox.list_messages()[0]["attachment"]["id"]
+    assert controller.attachment_info(attachment_id)["max_download_bytes"] == 30
+    with pytest.raises(ServiceError, match="exceeds"):
+        await controller.read_attachment(attachment_id)
+    with pytest.raises(ServiceError, match="Numeric identifier"):
+        await controller.read_attachment(attachment_id, max_bytes=31)
+    assert bot.calls == []
+
+
+async def test_attachment_metadata_requires_current_binding(setup):
+    store, inbox, _, controller = setup
+    await controller.handle_update(document())
+    attachment_id = inbox.list_messages()[0]["attachment"]["id"]
+    store.set_active_by_telegram(7001, False)
+    with pytest.raises(ServiceError, match="unavailable"):
+        controller.attachment_info(attachment_id)

@@ -64,6 +64,7 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
                         "file_id": "synthetic_file",
                         "file_name": "notes.txt",
                         "mime_type": "text/plain",
+                        "file_size": 26,
                     },
                 },
             }
@@ -72,6 +73,7 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
             assert sent == []  # Incoming ordinary messages never trigger an unsolicited response.
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
+                base_url="http://127.0.0.1",
                 headers={"Authorization": "Bearer " + config.auth_token},
             ) as http:
                 async with streamable_http_client(
@@ -97,6 +99,18 @@ async def test_real_sdk_receive_file_read_reply_and_deduplicate(tmp_path):
                             block.resource for block in content.content if block.type == "resource"
                         )
                         assert base64.b64decode(resource.blob) == b"Synthetic document content"
+                        path = "/attachments/" + item["attachment"]["id"]
+                        assert (
+                            await http.get(path, headers={"Authorization": "Bearer wrong"})
+                        ).status_code == 401
+                        download = await http.get(path)
+                        assert download.status_code == 200
+                        assert download.content == b"Synthetic document content"
+                        assert download.headers["cache-control"] == "no-store"
+                        assert download.headers["content-disposition"].startswith("attachment;")
+                        assert (
+                            await http.get(path, headers={"Host": "attacker.invalid"})
+                        ).status_code == 421
                         args = {
                             "message_id": item["id"],
                             "text": "Read your file",

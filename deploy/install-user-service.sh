@@ -32,7 +32,7 @@ fi
 cd "$app"
 "$uv_bin" sync --frozen --no-dev --no-editable
 install -d -m 700 "$HOME/.config/telegram-ping-mcp" \
-    "$HOME/.local/share/telegram-ping-mcp" "$HOME/.config/systemd/user"
+    /srv/apps/telegram-ping-mcp/data "$HOME/.config/systemd/user"
 if [ ! -e "$HOME/.config/telegram-ping-mcp/server.env" ]; then
     install -m 600 deploy/server.env.example "$HOME/.config/telegram-ping-mcp/server.env"
 fi
