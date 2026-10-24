@@ -1,5 +1,10 @@
 # systemd user deployment
 
+Build Telegram Bot API and native dependencies on the local workstation for
+Linux ARM64. The production server receives ready artifacts; do not compile
+sources or install build tools there. Local cross-build scratch stays in the
+project's ignored `temp/local-build/` environment.
+
 The service runs as `apps` from `/srv/apps/telegram-ping-mcp/app` and listens on
 `127.0.0.1:18007`. Confirm that the port is available before installation. Keep
 the listener on loopback and configure HTTPS ingress before connecting a remote
