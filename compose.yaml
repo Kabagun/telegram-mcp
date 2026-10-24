@@ -1,0 +1,22 @@
+services:
+  telegram-ping-mcp:
+    build: .
+    image: telegram-ping-mcp:local
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - telegram_ping_data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  telegram_ping_data:

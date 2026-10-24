@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram Ping MCP
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/apps/telegram-ping-mcp/app
+EnvironmentFile=%h/.config/telegram-ping-mcp/server.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/apps/telegram-ping-mcp/app/.venv/bin/telegram-ping-mcp serve --transport http --host 127.0.0.1 --port 18004
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
