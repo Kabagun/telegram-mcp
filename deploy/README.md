@@ -20,6 +20,9 @@ directories. Use those returned paths; do not invent a checkout or dependency
 location. The platform does not fetch Git
 repositories or run package managers as root. Prepare code and dependencies with
 the deployment owner's authorized permissions in the assigned workspace.
+When copying into existing runtime-owned directories, preserve their ownership,
+permissions and ACLs; write access does not grant permission to reset directory
+metadata.
 
 Build the application wheel locally and prepare the locked production dependency
 set for the runtime's Python version and Linux ARM64 target. Transfer ready wheels
