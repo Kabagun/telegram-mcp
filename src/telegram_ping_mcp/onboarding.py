@@ -44,7 +44,7 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
 
     Telegram measures entity offsets in UTF-16 units. Only our known guide lines
     are formatted; user messages and short command statuses receive no markup.
-    The caller must pass the final text so appended codes retain exact offsets.
+    The caller must pass the final text so login codes retain exact offsets.
     """
     lines = text.split("\n")
     if _CHATGPT_HEADING not in lines:
@@ -138,10 +138,20 @@ def intro_text(*, linked: bool) -> str:
     )
 
 
-def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
+def onboarding_text(
+    public_mcp_url: str = "", *, linked: bool = False, login_code: str | None = None
+) -> str:
     """Return one plain-text Telegram message, also safe with a maximum-length URL."""
     endpoint = normalize_public_mcp_url(public_mcp_url)
     address = endpoint or "адрес подключения запросите у владельца."
+    code_section = (
+        "🔑 Код подключения\n"
+        f"Код входа: {login_code}\n"
+        "Без срока действия. Используется один раз.\n"
+        "Скопируйте код в окно подключения.\n\n"
+        if login_code is not None
+        else ""
+    )
     privacy = (
         "• Плагин работает только с вашим чатом с ботом. Он не входит в Telegram-аккаунт "
         "и не видит остальные переписки, контакты и группы.\n"
@@ -152,7 +162,7 @@ def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
         "• Отключить — /unlink."
     )
     return (
-        _CHATGPT_HEADING + "\n"
+        f"{_CHATGPT_HEADING}\n"
         "https://chatgpt.com/ → Плагины → +\n"
         "Добавить пользовательский сервер MCP\n\n"
         "2️⃣ Заполните поля\n"
@@ -161,6 +171,7 @@ def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
         "Подключение: URL-адрес сервера\n"
         f"URL-адрес сервера: {address}\n"
         "Аутентификация: OAuth\n\n"
+        f"{code_section}"
         "3️⃣ Завершите подключение\n"
         "«Я понимаю и хочу продолжить» → «Создать в виде плагина».\n"
         "Установите плагин. В AI-чате выберите @Telegram.\n"

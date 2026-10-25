@@ -122,6 +122,7 @@ class Service:
         self._bot_username = bot_username
         self._link_ttl_seconds = link_ttl_seconds
         self._allowed_group_chat_ids = allowed_group_chat_ids
+        self._public_mcp_url = public_mcp_url
         self._onboarding_text = onboarding_text(public_mcp_url)
         self._linked_onboarding_text = onboarding_text(public_mcp_url, linked=True)
         self._login_code_issuer = login_code_issuer
@@ -401,8 +402,7 @@ class Service:
                 return _CONNECT_STOPPED
             code = _safe_text(self._login_code_issuer(binding["user_key"]), maximum=128)
             return _message_text(
-                f"{response}\n\n🔑 Код подключения\nКод входа: {code}\n"
-                "Действует 10 минут. Скопируйте его в открывшееся окно подключения."
+                onboarding_text(self._public_mcp_url, linked=True, login_code=code)
             )
         except Exception:
             return f"{response}\n\n{_CONNECT_RETRY}"

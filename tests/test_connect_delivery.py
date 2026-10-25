@@ -129,6 +129,21 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_e
     if active is not False:
         assert issued == [user["user_key"]]
         assert "Код входа: synthetic-code-1\n" in guide["text"]
+        sections = (
+            "Название: Telegram\n",
+            "Описание: Уведомления, ответы и файлы через Telegram-бота.\n",
+            f"URL-адрес сервера: {PUBLIC_URL}\n",
+            "Аутентификация: OAuth\n\n🔑 Код подключения\n",
+            "Код входа: synthetic-code-1\n",
+            "3️⃣ Завершите подключение\n",
+            ICON_NOTE,
+            "Claude\n",
+            "🔒 Доступ и приватность\n",
+        )
+        offsets = [guide["text"].index(section) for section in sections]
+        assert offsets == sorted(offsets)
+        assert "Без срока действия. Используется один раз." in guide["text"]
+        assert "10 минут" not in guide["text"]
         assert "приглашение" not in guide["text"]
         assert any(entity["type"] == "bold" for entity in entities)
         copies = [

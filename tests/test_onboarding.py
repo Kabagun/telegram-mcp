@@ -174,10 +174,32 @@ def copy_buttons(keyboard: dict) -> dict[str, str]:
     }
 
 
+def assert_code_placement(text: str, code: str) -> None:
+    sections = (
+        "Название: Telegram\n",
+        "Описание: Уведомления, ответы и файлы через Telegram-бота.\n",
+        "URL-адрес сервера: ",
+        "Аутентификация: OAuth\n",
+        "🔑 Код подключения\n",
+        f"Код входа: {code}\n",
+        "3️⃣ Завершите подключение\n",
+        "📎 Иконка PNG — файлом ниже.",
+        "Claude\n",
+        "🔒 Доступ и приватность\n",
+    )
+    offsets = [text.index(section) for section in sections]
+    assert offsets == sorted(offsets)
+    assert "Аутентификация: OAuth\n\n🔑 Код подключения\n" in text
+    assert f"Код входа: {code}\nБез срока действия. Используется один раз.\n" in text
+    assert "Скопируйте код в окно подключения.\n\n3️⃣ Завершите подключение" in text
+    assert "10 минут" not in text
+
+
 @pytest.mark.parametrize("code", ["synthetic-🙂-<&_`>", "synthetic\u2028🙂\u2029code"])
 def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji(code) -> None:
     endpoint = "https://пример.рф/подключение/🙂/mcp"
-    text = onboarding_text(endpoint, linked=True) + f"\n\nКод входа: {code}\nДействует 10 минут."
+    text = onboarding_text(endpoint, linked=True, login_code=code)
+    assert_code_placement(text, code)
     entities, keyboard = onboarding_presentation(text)
     assert keyboard is not None
     expected = {
@@ -193,6 +215,7 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
     assert [entity_text(text, item) for item in entities if item["type"] == "bold"] == [
         "1️⃣ Откройте ChatGPT",
         "2️⃣ Заполните поля",
+        "🔑 Код подключения",
         "3️⃣ Завершите подключение",
         "Claude",
         "🔒 Доступ и приватность",
@@ -212,7 +235,10 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
 
 @pytest.mark.parametrize("linked", [False, True])
 def test_presentation_without_a_login_code_has_no_code_button(linked) -> None:
-    _, keyboard = onboarding_presentation(onboarding_text(PUBLIC_URL, linked=linked))
+    text = onboarding_text(PUBLIC_URL, linked=linked)
+    assert "🔑 Код подключения" not in text
+    assert "Код входа:" not in text
+    _, keyboard = onboarding_presentation(text)
     assert keyboard is not None
     assert "📋 Код" not in copy_buttons(keyboard)
 
@@ -252,7 +278,7 @@ def test_presentation_omits_only_address_copy_button_over_256_utf16_units(length
     prefix = "https://example.test/"
     endpoint = prefix + "🙂" * ((length - len(prefix)) // 2) + "x" * ((length - len(prefix)) % 2)
     code = "🙂" * 128
-    text = onboarding_text(endpoint, linked=True) + f"\n\nКод входа: {code}"
+    text = onboarding_text(endpoint, linked=True, login_code=code)
     entities, keyboard = onboarding_presentation(text)
     assert keyboard is not None
     buttons = copy_buttons(keyboard)
@@ -381,9 +407,7 @@ async def test_connect_issues_fresh_codes_only_in_replies_and_keeps_binding(tmp_
         await service.handle_update(command("/connect"))
         response = bot.sends[-1]["text"]
         assert_guide(response, linked=True)
-        assert f"Код входа: synthetic-code-{index}" in response
-        assert "Действует 10 минут" in response
-        assert "Скопируйте его в открывшееся окно подключения" in response
+        assert_code_placement(response, f"synthetic-code-{index}")
     assert "synthetic-code-1" not in bot.sends[-1]["text"]
     assert issued_for == ["synthetic", "synthetic"]
     with sqlite3.connect(database) as connection:
@@ -532,7 +556,7 @@ async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(
 
     def issue(user_key):
         calls.append(user_key)
-        if len(calls) == 1:
+        if len(calls) != 2:
             raise RuntimeError("synthetic-private-error")
         return "synthetic-retry-code"
 
@@ -546,10 +570,18 @@ async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(
     assert service.find_users() == before
     await service.handle_update(command("/connect"))
     assert "Код входа: synthetic-retry-code" in bot.sends[-1]["text"]
-    assert calls == ["synthetic", "synthetic"]
+    await service.handle_update(command("/connect"))
+    assert bot.sends[-1]["text"].endswith("Не удалось получить код входа. Повторите /connect.")
+    assert "synthetic-retry-code" not in bot.sends[-1]["text"]
+    assert "Код входа:" not in bot.sends[-1]["text"]
+    assert "📋 Код" not in copy_buttons(bot.sends[-1]["reply_markup"])
+    assert calls == ["synthetic", "synthetic", "synthetic"]
 
 
-@pytest.mark.parametrize("code", [None, "", "x" * 129, "synthetic\nprivate", "\ud800"])
+@pytest.mark.parametrize(
+    "code",
+    [None, "", " ", "x" * 129, "synthetic\nprivate", "synthetic\rprivate", "\x00", "\ud800"],
+)
 async def test_invalid_issued_code_uses_safe_retry_response(tmp_path, code) -> None:
     store = Store(tmp_path / "invalid-code.sqlite3")
     bind(store)

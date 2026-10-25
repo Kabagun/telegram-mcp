@@ -15,6 +15,7 @@ from telegram_ping_mcp.telegram import TelegramClient
 
 async def test_connect_runs_formatted_message_then_exact_png_through_real_client(tmp_path):
     calls = []
+    code = "synthetic-🙂-copy-code"
 
     def api(request):
         method = request.url.path.rsplit("/", 1)[-1]
@@ -33,7 +34,7 @@ async def test_connect_runs_formatted_message_then_exact_png_through_real_client
             TelegramClient("123:synthetic-token", client=client),
             "synthetic_bot",
             public_mcp_url="https://connector.example.test/mcp",
-            login_code_issuer=lambda key: "synthetic-copy-code",
+            login_code_issuer=lambda key: code,
         )
         await service.handle_update(
             {
@@ -47,9 +48,37 @@ async def test_connect_runs_formatted_message_then_exact_png_through_real_client
     assert [method for method, _ in calls] == ["sendMessage", "sendDocument", "setMyCommands"]
     guide = json.loads(calls[0][1].content)
     assert "Иконка PNG — файлом ниже" in guide["text"]
-    assert any(entity["type"] == "bold" for entity in guide["entities"])
+    sections = (
+        "Название: Telegram\n",
+        "Описание: Уведомления, ответы и файлы через Telegram-бота.\n",
+        "URL-адрес сервера: https://connector.example.test/mcp\n",
+        "Аутентификация: OAuth\n\n🔑 Код подключения\n",
+        f"Код входа: {code}\n",
+        "3️⃣ Завершите подключение\n",
+        "📎 Иконка PNG — файлом ниже.",
+        "Claude\n",
+        "🔒 Доступ и приватность\n",
+    )
+    offsets = [guide["text"].index(section) for section in sections]
+    assert offsets == sorted(offsets)
+    assert "Без срока действия. Используется один раз." in guide["text"]
+    assert "10 минут" not in guide["text"]
+    formatted = {}
+    encoded = guide["text"].encode("utf-16-le")
+    for entity in guide["entities"]:
+        start = entity["offset"] * 2
+        end = start + entity["length"] * 2
+        formatted[encoded[start:end].decode("utf-16-le")] = entity
+    assert formatted[code]["type"] == "code"
+    assert (
+        formatted[code]["offset"]
+        == len(guide["text"][: guide["text"].index(code)].encode("utf-16-le")) // 2
+    )
+    assert formatted[code]["length"] == len(code.encode("utf-16-le")) // 2
+    for heading in ("🔑 Код подключения", "3️⃣ Завершите подключение", "🔒 Доступ и приватность"):
+        assert formatted[heading]["type"] == "bold"
     buttons = [b for row in guide["reply_markup"]["inline_keyboard"] for b in row]
-    assert any(b.get("copy_text", {}).get("text") == "synthetic-copy-code" for b in buttons)
+    assert any(b.get("copy_text", {}).get("text") == code for b in buttons)
     assert "parse_mode" not in guide
     request = calls[1][1]
     message = BytesParser(policy=default).parsebytes(
@@ -138,6 +167,8 @@ async def test_new_private_connect_issues_own_oauth_code_without_invitation_and_
         assert "приглашение" not in guide["text"]
         assert "URL-адрес сервера: https://connector.example.test/mcp\n" in guide["text"]
         code = guide["text"].split("Код входа: ", 1)[1].split("\n", 1)[0]
+        assert guide["text"].index("Аутентификация: OAuth\n") < guide["text"].index(code)
+        assert guide["text"].index(code) < guide["text"].index("3️⃣ Завершите подключение\n")
         codes.append(code)
         buttons = [button for row in guide["reply_markup"]["inline_keyboard"] for button in row]
         assert any(button.get("copy_text", {}).get("text") == code for button in buttons)

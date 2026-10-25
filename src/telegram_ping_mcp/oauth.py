@@ -52,7 +52,9 @@ SCOPE = OAUTH_SCOPE
 ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 86400
 CODE_TTL = 300
-LOGIN_TTL = 600
+CONSENT_TTL = 600
+# Keep the existing NOT NULL schema; zero means an unused bot code has no time limit.
+LOGIN_CODE_NO_EXPIRY = 0
 CLIENT_TTL = 86400
 MAX_CLIENTS = 1000
 MAX_PENDING = 1000
@@ -365,6 +367,12 @@ class OAuthProvider(
             }:
                 db.execute("ALTER TABLE grants ADD COLUMN family_hash TEXT NOT NULL DEFAULT ''")
                 db.execute("UPDATE grants SET family_hash = refresh_hash")
+            # Preserve only still-valid pending bot codes from versions with a time limit.
+            # Expired legacy codes must remain expired and be removed by collection below.
+            db.execute(
+                "UPDATE login_codes SET expires_at = ? WHERE expires_at > ?",
+                (LOGIN_CODE_NO_EXPIRY, int(time.time())),
+            )
             self._gc(db)
 
     def _db(self):
@@ -378,8 +386,12 @@ class OAuthProvider(
             "(SELECT client_id FROM grants WHERE refresh_expires > ?)",
             (now, now),
         )
-        for table in ("pending", "login_codes", "codes", "refresh_history"):
+        for table in ("pending", "codes", "refresh_history"):
             db.execute(f"DELETE FROM {table} WHERE expires_at <= ?", (now,))
+        db.execute(
+            "DELETE FROM login_codes WHERE expires_at != ? AND expires_at <= ?",
+            (LOGIN_CODE_NO_EXPIRY, now),
+        )
         db.execute("DELETE FROM grants WHERE refresh_expires <= ?", (now,))
         db.execute("DELETE FROM pending WHERE client_id NOT IN (SELECT client_id FROM clients)")
         db.execute("DELETE FROM codes WHERE client_id NOT IN (SELECT client_id FROM clients)")
@@ -443,7 +455,7 @@ class OAuthProvider(
                     user_key,
                     _hash(self._normalize_login(code)),
                     user["telegram_user_id"],
-                    int(time.time()) + LOGIN_TTL,
+                    LOGIN_CODE_NO_EXPIRY,
                 ),
             )
         return code
@@ -581,7 +593,7 @@ class OAuthProvider(
                     _hash(nonce),
                     client.client_id,
                     params.model_dump_json(),
-                    int(time.time()) + LOGIN_TTL,
+                    int(time.time()) + CONSENT_TTL,
                 ),
             )
         return self.issuer_url + "/oauth/consent?" + urlencode({"request": nonce})
@@ -800,6 +812,8 @@ class OAuthProvider(
             callback = urlsplit(str(params.redirect_uri))
             domain = html.escape(callback.netloc)
             headers = dict(_SECURITY_HEADERS)
+            # Native same-origin form submissions must retain Origin for the strict check below.
+            headers["Referrer-Policy"] = "same-origin"
             # Some browsers apply form-action to the redirect following a form POST.
             # Permit only the validated callback origin in addition to our own form.
             headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
@@ -827,7 +841,7 @@ class OAuthProvider(
             response.set_cookie(
                 _COOKIE,
                 csrf,
-                max_age=LOGIN_TTL,
+                max_age=CONSENT_TTL,
                 secure=True,
                 httponly=True,
                 samesite="lax",

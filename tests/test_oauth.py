@@ -12,7 +12,13 @@ import pytest
 from mcp.server.auth.provider import TokenError
 from starlette.applications import Starlette
 
-from telegram_ping_mcp.oauth import OAuthProvider, UserAccessToken
+from telegram_ping_mcp.oauth import (
+    CONSENT_TTL,
+    LOGIN_CODE_NO_EXPIRY,
+    REFRESH_TTL,
+    OAuthProvider,
+    UserAccessToken,
+)
 
 ISSUER = "https://connector.example.test"
 RESOURCE = ISSUER + "/mcp"
@@ -218,14 +224,20 @@ async def test_csrf_origin_and_cookie_fail_before_code_consumption(client, setup
     assert "не входит в Telegram-аккаунт" in page.text
     assert "не видит остальные переписки, контакты и группы" in page.text
     assert page.headers["cache-control"] == "no-store"
-    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["referrer-policy"] == "same-origin"
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     assert "HttpOnly" in page.headers["set-cookie"]
     assert "Secure" in page.headers["set-cookie"]
     assert "SameSite=lax" in page.headers["set-cookie"]
+    assert f"Max-Age={CONSENT_TTL}" in page.headers["set-cookie"]
     login = provider.issue_login_code("synthetic")
     data = {**fields, "code": login, "decision": "allow"}
-    assert (await client.post("/oauth/consent", data=data)).status_code == 403
+    missing_origin = await client.post("/oauth/consent", data=data)
+    assert missing_origin.status_code == 403
+    assert missing_origin.headers["referrer-policy"] == "no-referrer"
+    assert (
+        await client.post("/oauth/consent", data=data, headers={"origin": "null"})
+    ).status_code == 403
     assert (
         await client.post(
             "/oauth/consent",
@@ -252,13 +264,9 @@ async def test_csrf_origin_and_cookie_fail_before_code_consumption(client, setup
     client.cookies.set(
         "__Secure-ai-connector-csrf", cookie, domain="connector.example.test", path="/oauth/consent"
     )
-    assert (
-        await client.post(
-            "/oauth/consent",
-            data=data,
-            headers={"origin": ISSUER},
-        )
-    ).status_code == 302
+    approved = await client.post("/oauth/consent", data=data, headers={"origin": ISSUER})
+    assert approved.status_code == 302
+    assert approved.headers["referrer-policy"] == "no-referrer"
     assert (
         await client.post(
             "/oauth/consent",
@@ -436,7 +444,8 @@ async def test_expiry_and_single_use_are_checked_at_exchange(client, setup):
     fields, _ = await begin(client, registration)
     login = provider.issue_login_code("synthetic")
     with sqlite3.connect(path) as db:
-        db.execute("UPDATE login_codes SET expires_at = 0")
+        # Finite expired rows from older versions are still invalid.
+        db.execute("UPDATE login_codes SET expires_at = 1")
     assert (
         await client.post(
             "/oauth/consent",
@@ -449,6 +458,178 @@ async def test_expiry_and_single_use_are_checked_at_exchange(client, setup):
     assert (
         await client.get("/oauth/consent", params={"request": fields["request"]})
     ).status_code == 400
+
+
+@pytest.mark.parametrize("elapsed", [601, 10 * 365 * 86400])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_login_code_has_no_time_limit_and_is_consumed_once(
+    setup, monkeypatch, elapsed, restart
+):
+    provider, users, path = setup
+    now = [1_800_000_000]
+    monkeypatch.setattr("telegram_ping_mcp.oauth.time.time", lambda: now[0])
+    login = provider.issue_login_code("synthetic")
+    with sqlite3.connect(path) as db:
+        assert (
+            db.execute("SELECT expires_at FROM login_codes").fetchone()[0] == LOGIN_CODE_NO_EXPIRY
+        )
+    now[0] += elapsed
+    if restart:
+        provider = OAuthProvider(path, issuer_url=ISSUER, resource_url=RESOURCE, get_user=users.get)
+    app = Starlette(routes=provider.create_routes())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=ISSUER, follow_redirects=False
+    ) as client:
+        registration = await register(client)
+        fields, _ = await begin(client, registration)
+        response = await client.post(
+            "/oauth/consent",
+            data={**fields, "code": login, "decision": "allow"},
+            headers={"origin": ISSUER},
+        )
+        assert response.status_code == 302, response.text
+        code = parse_qs(urlsplit(response.headers["location"]).query)["code"][0]
+        assert (await exchange(client, registration, code)).status_code == 200
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 0
+        # A fresh browser request cannot reuse a bot code consumed by successful consent.
+        fields, _ = await begin(client, registration)
+        assert (
+            await client.post(
+                "/oauth/consent",
+                data={**fields, "code": login, "decision": "allow"},
+                headers={"origin": ISSUER},
+            )
+        ).status_code == 400
+
+
+@pytest.mark.parametrize("expired_delta", [-1, 0])
+async def test_startup_migrates_only_unexpired_legacy_login_codes(
+    setup, monkeypatch, expired_delta
+):
+    provider, users, path = setup
+    now = [1_800_000_000]
+    monkeypatch.setattr("telegram_ping_mcp.oauth.time.time", lambda: now[0])
+    valid = provider.issue_login_code("synthetic")
+    expired = provider.issue_login_code("second")
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE login_codes SET expires_at = ? WHERE user_key = 'synthetic'",
+            (now[0] + 600,),
+        )
+        db.execute(
+            "UPDATE login_codes SET expires_at = ? WHERE user_key = 'second'",
+            (now[0] + expired_delta,),
+        )
+    restarted = OAuthProvider(path, issuer_url=ISSUER, resource_url=RESOURCE, get_user=users.get)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT user_key, expires_at FROM login_codes").fetchall() == [
+            ("synthetic", LOGIN_CODE_NO_EXPIRY)
+        ]
+    now[0] += 365 * 86400
+    app = Starlette(routes=restarted.create_routes())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=ISSUER, follow_redirects=False
+    ) as client:
+        registration = await register(client)
+        fields, _ = await begin(client, registration)
+        assert (
+            await client.post(
+                "/oauth/consent",
+                data={**fields, "code": expired, "decision": "allow"},
+                headers={"origin": ISSUER},
+            )
+        ).status_code == 400
+        response = await client.post(
+            "/oauth/consent",
+            data={**fields, "code": valid, "decision": "allow"},
+            headers={"origin": ISSUER},
+        )
+        assert response.status_code == 302, response.text
+
+
+async def test_gc_keeps_login_codes_but_preserves_other_oauth_expiry(client, setup, monkeypatch):
+    provider, _, path = setup
+    started = 1_800_000_000
+    now = [started]
+    monkeypatch.setattr("telegram_ping_mcp.oauth.time.time", lambda: now[0])
+    active, _unused = await register(client), await register(client)
+    tokens = await token_pair(client, provider, active)
+    registered = await provider.get_client(active["client_id"])
+    refresh = await provider.load_refresh_token(registered, tokens["refresh_token"])
+    await provider.exchange_refresh_token(registered, refresh, refresh.scopes)
+    await approve(client, provider, active)
+    fields, _ = await begin(client, active)
+    provider.issue_login_code("second")
+    expiring_tables = ("pending", "codes", "grants", "refresh_history", "clients")
+    with sqlite3.connect(path) as db:
+        assert {
+            table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in expiring_tables
+        } == {"pending": 1, "codes": 1, "grants": 1, "refresh_history": 1, "clients": 2}
+        assert db.execute("SELECT expires_at FROM pending").fetchone()[0] == started + CONSENT_TTL
+        assert db.execute("SELECT expires_at FROM codes").fetchone()[0] == started + 300
+        assert db.execute("SELECT access_expires FROM grants").fetchone()[0] == started + 3600
+        assert (
+            db.execute("SELECT refresh_expires FROM grants").fetchone()[0] == started + REFRESH_TTL
+        )
+        assert (
+            db.execute("SELECT expires_at FROM refresh_history").fetchone()[0]
+            == started + REFRESH_TTL
+        )
+        assert {row[0] for row in db.execute("SELECT expires_at FROM clients")} == {started + 86400}
+    now[0] += CONSENT_TTL + 1
+    assert (
+        await client.get("/oauth/consent", params={"request": fields["request"]})
+    ).status_code == 400
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM grants").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM refresh_history").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM clients").fetchone()[0] == 2
+    now[0] = started + REFRESH_TTL + 1
+    with provider._db() as db:
+        provider._gc(db)
+        assert all(
+            db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            for table in expiring_tables
+        )
+        assert (
+            db.execute("SELECT expires_at FROM login_codes").fetchall()[0][0]
+            == LOGIN_CODE_NO_EXPIRY
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"active": False}, {"telegram_user_id": 7999}, {"user_key": "second"}, {"chat_id": 7002}],
+)
+async def test_login_code_rechecks_active_user_and_sender_binding(client, setup, changed):
+    provider, users, path = setup
+    registration = await register(client)
+    login = provider.issue_login_code("synthetic")
+    fields, _ = await begin(client, registration)
+    original = users["synthetic"].copy()
+    users["synthetic"].update(changed)
+    assert (
+        await client.post(
+            "/oauth/consent",
+            data={**fields, "code": login, "decision": "allow"},
+            headers={"origin": ISSUER},
+        )
+    ).status_code == 400
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+    users["synthetic"] = original
+    assert (
+        await client.post(
+            "/oauth/consent",
+            data={**fields, "code": login, "decision": "allow"},
+            headers={"origin": ISSUER},
+        )
+    ).status_code == 302
 
 
 async def test_pending_login_and_grant_capacity_are_bounded(client, setup, monkeypatch):
