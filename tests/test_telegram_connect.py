@@ -79,12 +79,11 @@ async def test_connector_icon_uploads_exact_packaged_png_with_fixed_fields(base_
     }
 
 
-async def test_connector_icon_serializes_persistent_keyboard_in_multipart_field():
+async def test_connector_icon_serializes_collapsible_keyboard_in_multipart_field():
     calls = []
     markup = {
         "keyboard": [[{"text": label}] for label in list(BUTTON_ACTIONS)[:4]],
         "resize_keyboard": True,
-        "is_persistent": True,
     }
 
     def api(request):
@@ -122,7 +121,6 @@ async def test_connector_icon_invalid_keyboard_fails_before_resource_access(monk
                 reply_markup={
                     "keyboard": [[{"text": "Synthetic"}]],
                     "resize_keyboard": True,
-                    "is_persistent": True,
                 },
             )
 
@@ -352,7 +350,6 @@ async def test_message_preserves_each_static_reply_keyboard_label(label):
     markup = {
         "keyboard": [[{"text": label}]],
         "resize_keyboard": True,
-        "is_persistent": True,
     }
 
     def api(request):
@@ -369,11 +366,16 @@ async def test_message_preserves_each_static_reply_keyboard_label(label):
 @pytest.mark.parametrize(
     "markup",
     [
-        {"keyboard": [[{"text": label}]], "resize_keyboard": True}
+        {"keyboard": [[{"text": label}]], "resize_keyboard": True, "is_persistent": True}
         for label in list(BUTTON_ACTIONS)[:1]
     ]
     + [
-        {"keyboard": keyboard, "resize_keyboard": resize, "is_persistent": persistent, **extra}
+        {
+            "keyboard": keyboard,
+            "resize_keyboard": resize,
+            **({"is_persistent": persistent} if persistent is not True else {}),
+            **extra,
+        }
         for keyboard, resize, persistent, extra in [
             ([], True, True, {}),
             ([[]], True, True, {}),
@@ -424,7 +426,6 @@ async def test_non_static_or_malformed_reply_keyboard_fails_before_network(marku
         {
             "keyboard": [[{"text": label}]],
             "resize_keyboard": True,
-            "is_persistent": True,
         }
         for label in (
             "🔌 Подключить",

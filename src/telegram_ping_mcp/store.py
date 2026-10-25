@@ -339,8 +339,12 @@ class Store:
             result["error"] = row["error"]
         return result
 
-    def reserve_delivery(self, request_id: str, fingerprint: str) -> dict[str, Any]:
+    def reserve_delivery(
+        self, request_id: str, fingerprint: str, *, retry_failed: bool = False
+    ) -> dict[str, Any]:
         self._text(request_id, "Request ID")
+        if not isinstance(retry_failed, bool):
+            raise ValueError("Retry policy is invalid.")
         if (
             not isinstance(fingerprint, str)
             or len(fingerprint) != 64
@@ -355,6 +359,13 @@ class Store:
             if row is not None:
                 if row["fingerprint"] != fingerprint:
                     raise ValueError("Request ID was already used for a different delivery.")
+                if retry_failed and row["status"] == "failed":
+                    connection.execute(
+                        "UPDATE deliveries SET status = 'sending', message_id = NULL, "
+                        "error = NULL WHERE request_id = ? AND status = 'failed'",
+                        (request_id,),
+                    )
+                    return {"status": "sending", "is_new": True}
                 return self._delivery(row, is_new=False)
             connection.execute(
                 "INSERT INTO deliveries (request_id, fingerprint, status) VALUES (?, ?, 'sending')",

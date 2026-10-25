@@ -1,3 +1,4 @@
+import json
 import sys
 
 import pytest
@@ -136,4 +137,111 @@ def test_help_displays_commands(capsys: pytest.CaptureFixture[str]) -> None:
     assert error.value.code == 0
     assert "doctor" in captured.out
     assert "serve" in captured.out
+    assert "broadcast-release" in captured.out
     assert captured.err == ""
+
+
+def test_release_broadcast_uses_installed_version_closes_client_and_only_prints_counts(
+    tmp_path, monkeypatch, capsys
+):
+    config = Config(bot_token=BOT_TOKEN, database_path=tmp_path / "synthetic.sqlite3")
+    _mock_configuration(monkeypatch, config)
+    message = "Синтетическое обновление\n\n• Новая возможность."
+    message_file = tmp_path / "synthetic-release.txt"
+    message_file.write_text(message, encoding="utf-8")
+    clients = []
+    received = []
+
+    class FakeClient:
+        def __init__(self, token, **kwargs):
+            assert token == BOT_TOKEN
+            assert kwargs["api_base_url"] == config.api_base_url
+            self.closed = False
+            clients.append(self)
+
+        async def aclose(self):
+            self.closed = True
+
+    async def send(store, bot, **kwargs):
+        received.append({"path": store.path, "bot": bot, **kwargs})
+        return {"sent": 2, "failed": 1}
+
+    monkeypatch.setattr(cli, "TelegramClient", FakeClient)
+    monkeypatch.setattr(cli, "broadcast_release", send)
+    monkeypatch.setattr(cli, "installed_version", lambda name: "9.8.7")
+    monkeypatch.setattr(cli, "Runtime", lambda *_a, **_kw: pytest.fail("broadcast must not poll"))
+
+    assert (
+        cli.main(["broadcast-release", "--message-file", str(message_file), "--retry-failed"]) == 0
+    )
+
+    assert received == [
+        {
+            "path": config.database_path,
+            "bot": clients[0],
+            "version": "9.8.7",
+            "message": message,
+            "retry_failed": True,
+        }
+    ]
+    assert clients[0].closed
+    output = capsys.readouterr()
+    assert json.loads(output.out) == {"sent": 2, "failed": 1}
+    assert output.err == ""
+
+
+def test_release_broadcast_requires_message_file(capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["broadcast-release"])
+    assert error.value.code == 2
+    assert "--message-file" in capsys.readouterr().err
+
+
+def test_release_broadcast_file_errors_do_not_expose_paths_or_credentials(
+    tmp_path, monkeypatch, capsys
+):
+    _mock_configuration(monkeypatch, Config(bot_token=BOT_TOKEN))
+    missing = tmp_path / "synthetic-private-message-path.txt"
+    monkeypatch.setattr(
+        cli, "TelegramClient", lambda *_a, **_kw: pytest.fail("missing input must fail offline")
+    )
+
+    assert cli.main(["broadcast-release", "--message-file", str(missing)]) == 1
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "Release broadcast failed.\n"
+    assert BOT_TOKEN not in output.err
+    assert str(missing) not in output.err
+
+
+def test_release_broadcast_closes_client_and_redacts_unexpected_failure(
+    tmp_path, monkeypatch, capsys
+):
+    _mock_configuration(
+        monkeypatch, Config(bot_token=BOT_TOKEN, database_path=tmp_path / "synthetic.sqlite3")
+    )
+    message_file = tmp_path / "synthetic-release.txt"
+    message_file.write_text("Synthetic release", encoding="utf-8")
+    closed = []
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic-private-content-and-token")
+
+    monkeypatch.setattr(cli, "TelegramClient", FakeClient)
+    monkeypatch.setattr(cli, "broadcast_release", fail)
+    monkeypatch.setattr(cli, "installed_version", lambda name: "9.8.7")
+
+    assert cli.main(["broadcast-release", "--message-file", str(message_file)]) == 1
+
+    assert closed == [True]
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == "Release broadcast failed.\n"

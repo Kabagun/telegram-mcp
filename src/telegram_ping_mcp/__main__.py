@@ -5,13 +5,17 @@ import asyncio
 import json
 import logging
 import sys
+from importlib.metadata import version as installed_version
+from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
 
+from .broadcast import BroadcastError, broadcast_release
 from .config import Config, ConfigError
 from .server import Runtime, StartupError, create_http_app, create_mcp
-from .telegram import TelegramAPIError, TelegramTransportError
+from .store import Store
+from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 
 async def _stdio(runtime: Runtime) -> None:
@@ -19,10 +23,39 @@ async def _stdio(runtime: Runtime) -> None:
         await create_mcp(runtime).run_stdio_async()
 
 
+def _read_release_message(message_file: str) -> str:
+    with Path(message_file).open(encoding="utf-8") as source:
+        return source.read(4097)
+
+
+async def _broadcast(config: Config, message_file: str, *, retry_failed: bool) -> dict[str, int]:
+    if not config.bot_token:
+        raise BroadcastError("Telegram bot configuration is required.")
+    message = await asyncio.to_thread(_read_release_message, message_file)
+    release_version = installed_version("telegram-ping-mcp")
+    store = Store(config.database_path)
+    bot = TelegramClient(
+        config.bot_token,
+        api_base_url=config.api_base_url,
+        local_files_root=config.local_files_root,
+    )
+    try:
+        return await broadcast_release(
+            store, bot, version=release_version, message=message, retry_failed=retry_failed
+        )
+    finally:
+        await bot.aclose()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Bot-only Telegram Ping MCP")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Show offline configuration diagnostics without secrets")
+    broadcast = commands.add_parser(
+        "broadcast-release", help="Send an approved silent release notification once per version"
+    )
+    broadcast.add_argument("--message-file", required=True)
+    broadcast.add_argument("--retry-failed", action="store_true")
     serve = commands.add_parser("serve", help="Start the bot and MCP transport")
     serve.add_argument("--transport", choices=("http", "stdio"), default="http")
     serve.add_argument("--host", default="127.0.0.1")
@@ -37,6 +70,16 @@ def main(argv: list[str] | None = None) -> int:
         config = Config.from_env()
         if args.command == "doctor":
             print(json.dumps(config.diagnostic(), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "broadcast-release":
+            try:
+                result = asyncio.run(
+                    _broadcast(config, args.message_file, retry_failed=args.retry_failed)
+                )
+            except (Exception, asyncio.CancelledError):
+                print("Release broadcast failed.", file=sys.stderr)
+                return 1
+            print(json.dumps(result))
             return 0
         config.validate_for_serve(args.transport, args.host)
         if not 1 <= args.port <= 65535:

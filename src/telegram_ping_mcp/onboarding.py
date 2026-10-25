@@ -7,11 +7,13 @@ from .config import ConfigError, normalize_public_mcp_url
 
 PRIVACY_NOTICE = (
     "Плагин работает только с вашим чатом с ботом. Он не входит в Telegram-аккаунт "
-    "и не видит остальные переписки, контакты и группы. Подключённое AI-приложение "
+    "и не видит остальные переписки, контакты и группы.\n\n"
+    "Подключённое AI-приложение "
     "может читать сообщения и файлы, которые вы отправляете этому боту, "
-    "и присылать вам ответы. Другие пользователи не видят ваши данные. "
-    "Передача защищена HTTPS, доступ подтверждаете вы. "
-    "Отключить — /unlink."
+    "и присылать вам ответы.\n\n"
+    "Другие пользователи не видят ваши данные. "
+    "Передача защищена HTTPS, доступ подтверждаете вы.\n\n"
+    "Отключить связь можно кнопкой «🔗 Отключить всё»."
 )
 
 _NAME = "Telegram"
@@ -31,6 +33,7 @@ CALLBACK_ACTIONS = frozenset(
         "ui:help_claude",
         "ui:help_other",
         "ui:privacy",
+        "ui:details_back",
         "ui:unlink",
         "ui:unlink_confirm",
         "ui:cancel",
@@ -40,11 +43,25 @@ BUTTON_ACTIONS = {
     "🔌 Подключить AI-приложение": "ui:connect",
     "🔗 Отключить всё": "ui:unlink",
 }
+UNLINK_BUTTON_ACTIONS = {
+    "Отключить всё": "ui:unlink_confirm",
+    "Отмена": "ui:cancel",
+}
 _SECTION_HEADINGS = {
     *_CLIENT_HEADINGS.values(),
     "Настройки плагина",
     "🔑 Код подключения",
 }
+_DETAIL_HEADINGS = frozenset(
+    {
+        "Как подключить ChatGPT",
+        "Как подключить Claude",
+        "Как подключить другое AI-приложение",
+        "Доступ и приватность",
+        "Отключить все AI-приложения?",
+    }
+)
+_DETAILS_SEPARATOR = "\n\n──────────\n\n"
 
 
 def _icon_download_url(endpoint: str) -> str:
@@ -136,14 +153,68 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
 
 
 def command_menu(*, linked: bool = False) -> list[dict[str, str]]:
-    """Build a fresh Telegram command list for the current binding state."""
-    connect = {"command": "connect", "description": "Подключить AI-приложение"}
-    if not linked:
-        return [connect]
-    return [
-        connect,
-        {"command": "unlink", "description": "Отключить все AI-приложения"},
+    """Clear slash-command menus; navigation lives in the reply keyboard."""
+    return []
+
+
+def detail_entities(text: str) -> list[dict]:
+    """Bold a known static detail heading without interpreting message contents."""
+    heading = text.split("\n", 1)[0]
+    if heading not in _DETAIL_HEADINGS:
+        return []
+    return [{"type": "bold", "offset": 0, "length": _utf16_length(heading)}]
+
+
+def settings_details_presentation(
+    source_text: object, action: str, public_mcp_url: str = ""
+) -> tuple[str, list[dict], dict] | None:
+    """Expand or collapse a validated own-bot card using its existing exact values."""
+    if (
+        not isinstance(source_text, str)
+        or len(source_text) > 4096
+        or any(
+            unicodedata.category(char) == "Cs"
+            or (unicodedata.category(char) == "Cc" and char not in "\n\t")
+            for char in source_text
+        )
+        or _utf16_length(source_text) > 4096
+    ):
+        return None
+    base = source_text.split(_DETAILS_SEPARATOR, 1)[0]
+    client = next(
+        (key for key, heading in _CLIENT_HEADINGS.items() if base.startswith(heading + "\n\n")),
+        None,
+    )
+    if client is None:
+        return None
+    entities, markup = onboarding_presentation(base)
+    if markup is None:
+        return None
+    if action == "ui:details_back":
+        return base, entities, markup
+    if action == f"ui:help_{client}":
+        details, detail_markup = help_presentation(client, public_mcp_url)
+    elif action == "ui:privacy":
+        details, detail_markup = privacy_presentation()
+    else:
+        return None
+    text = base + _DETAILS_SEPARATOR + details
+    if _utf16_length(text) > 4096:
+        return None
+    detail_offset = _utf16_length(base + _DETAILS_SEPARATOR)
+    entities.extend(
+        {**entity, "offset": detail_offset + entity["offset"]}
+        for entity in detail_entities(details)
+    )
+    rows = [
+        [button for button in row if "copy_text" in button]
+        for row in markup["inline_keyboard"]
+        if any("copy_text" in button for button in row)
     ]
+    if detail_markup is not None:
+        rows.extend(detail_markup["inline_keyboard"])
+    rows.append([{"text": "← К настройкам", "callback_data": "ui:details_back"}])
+    return text, entities, {"inline_keyboard": rows}
 
 
 def intro_text(*, linked: bool) -> str:
@@ -179,18 +250,18 @@ def onboarding_text(
         raise ValueError("Login code is invalid.")
     address = endpoint or "адрес подключения запросите у владельца."
     code_section = (
-        f"🔑 Код подключения\nКод входа: {login_code}\nБез срока действия · одноразовый.\n\n"
+        f"🔑 Код подключения\n\nКод входа: {login_code}\n\nБез срока действия · одноразовый.\n\n"
         if login_code is not None
         else ""
     )
     return (
         f"{_CLIENT_HEADINGS[client]}\n\n"
-        "Настройки плагина\n"
-        f"Название: {_NAME}\n"
-        f"URL-адрес сервера: {address}\n"
+        "Настройки плагина\n\n"
+        f"Название: {_NAME}\n\n"
+        f"URL-адрес сервера: {address}\n\n"
         "Аутентификация: OAuth\n\n"
         f"{code_section}"
-        "Вставьте код в окне подключения.\n"
+        "Вставьте код в окне подключения.\n\n"
         "📎 Иконка PNG — файлом ниже."
     )
 
@@ -199,7 +270,15 @@ def menu_keyboard(*, linked: bool = False) -> dict:
     rows = [[{"text": "🔌 Подключить AI-приложение"}]]
     if linked:
         rows.append([{"text": "🔗 Отключить всё"}])
-    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
+def unlink_keyboard() -> dict:
+    """Keep confirmation and cancellation in a temporary interaction keyboard."""
+    return {
+        "keyboard": [[{"text": label}] for label in UNLINK_BUTTON_ACTIONS],
+        "resize_keyboard": True,
+    }
 
 
 def client_picker() -> tuple[str, dict]:
@@ -218,21 +297,22 @@ def help_presentation(client: str, public_mcp_url: str = "") -> tuple[str, dict 
     descriptions = {
         "chatgpt": (
             "Как подключить ChatGPT\n\n"
-            "1. chatgpt.com → Плагины → + → Добавить пользовательский сервер MCP.\n"
-            "2. Перенесите название, URL и OAuth из карточки настроек.\n"
+            "1. chatgpt.com → Плагины → + → Добавить пользовательский сервер MCP.\n\n"
+            "2. Перенесите название, URL и OAuth из карточки настроек.\n\n"
             "3. Создайте плагин и вставьте код в окне подключения.\n\n"
             "Если нужен значок, загрузите PNG-файл из этого чата."
         ),
         "claude": (
             "Как подключить Claude\n\n"
-            "claude.ai → Settings → Connectors → Add custom connector.\n\n"
-            "Укажите название и URL из карточки настроек. "
-            "В окне OAuth введите код подключения."
+            "1. claude.ai → Settings → Connectors → Add custom connector.\n\n"
+            "2. Укажите название и URL из карточки настроек.\n\n"
+            "3. В окне OAuth введите код подключения."
         ),
         "other": (
             "Как подключить другое AI-приложение\n\n"
-            "Добавьте удалённый MCP-сервер по URL из карточки настроек. "
-            "Выберите OAuth и введите код в открывшемся окне.\n\n"
+            "1. Добавьте удалённый MCP-сервер по URL из карточки настроек.\n\n"
+            "2. Выберите OAuth.\n\n"
+            "3. Введите код в открывшемся окне.\n\n"
             "Модель выбирается в вашем AI-приложении."
         ),
     }
@@ -253,22 +333,13 @@ def help_presentation(client: str, public_mcp_url: str = "") -> tuple[str, dict 
 
 
 def privacy_presentation() -> tuple[str, None]:
-    text = PRIVACY_NOTICE.replace(
-        "Отключить — /unlink.", "Отключить связь можно кнопкой «🔗 Отключить всё»."
-    )
-    return "Доступ и приватность\n\n" + text, None
+    return "Доступ и приватность\n\n" + PRIVACY_NOTICE, None
 
 
 def unlink_presentation() -> tuple[str, dict]:
     return (
         "Отключить все AI-приложения?\n\nВсе подключения и коды входа для этого чата "
-        "будут удалены. Подключиться заново можно кнопкой «🔌 Подключить AI-приложение».",
-        {
-            "inline_keyboard": [
-                [
-                    {"text": "Отключить всё", "callback_data": "ui:unlink_confirm"},
-                    {"text": "Отмена", "callback_data": "ui:cancel"},
-                ]
-            ]
-        },
+        "будут удалены.\n\n"
+        "Подключиться заново можно кнопкой «🔌 Подключить AI-приложение».",
+        unlink_keyboard(),
     )

@@ -392,7 +392,7 @@ async def test_link_commands_retired_stop_and_unlink_are_safe_and_idempotent(
     await service.handle_update(command("/start"))
     assert bot.sends[-1]["text"].startswith("AI Connector")
     assert "Подключить" in bot.sends[-1]["text"]
-    assert bot.sends[-1]["reply_markup"]["is_persistent"] is True
+    assert "is_persistent" not in bot.sends[-1]["reply_markup"]
     assert "ссылку-приглашение" not in bot.sends[-1]["text"]
     token = token_from(service.create_user_link("synthetic", "Synthetic"))
     await service.handle_update(command(f"/start@SYNTHETIC_BOT {token}"))

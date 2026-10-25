@@ -11,13 +11,16 @@ from telegram_ping_mcp.config import Config, ConfigError
 from telegram_ping_mcp.onboarding import (
     BUTTON_ACTIONS,
     CALLBACK_ACTIONS,
+    UNLINK_BUTTON_ACTIONS,
     client_picker,
     command_menu,
+    detail_entities,
     help_presentation,
     menu_keyboard,
     onboarding_presentation,
     onboarding_text,
     privacy_presentation,
+    unlink_keyboard,
 )
 from telegram_ping_mcp.server import Runtime
 from telegram_ping_mcp.service import Service, ServiceError
@@ -35,6 +38,10 @@ class FakeBot:
         self.documents: list[dict] = []
         self.command_menus: list[dict] = []
         self.acknowledgements: list[str] = []
+        self.deleted: list[tuple[int, int]] = []
+        self.delete_failure: Exception | None = None
+        self.edits: list[dict] = []
+        self.edit_failure: Exception | None = None
         self.failure = failure
         self.menu_failure = menu_failure
 
@@ -59,6 +66,17 @@ class FakeBot:
     async def answer_callback_query(self, query_id: str) -> None:
         self.acknowledgements.append(query_id)
 
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        self.deleted.append((chat_id, message_id))
+        if self.delete_failure is not None:
+            raise self.delete_failure
+
+    async def edit_message_text(self, chat_id: int, message_id: int, text: str, **kwargs) -> dict:
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kwargs})
+        if self.edit_failure is not None:
+            raise self.edit_failure
+        return {"message_id": message_id, "chat": {"id": chat_id}}
+
     async def aclose(self) -> None:
         pass
 
@@ -74,14 +92,21 @@ def command(text: str) -> dict:
     }
 
 
-def callback(action: str, *, telegram_id: int = 7001, query_id: str = "synthetic-query") -> dict:
-    return {
+def callback(
+    action: str,
+    *,
+    telegram_id: int = 7001,
+    query_id: str = "synthetic-query",
+    source_text: object = None,
+    message_id: int = 17,
+) -> dict:
+    update = {
         "update_id": 2,
         "callback_query": {
             "id": query_id,
             "from": {"id": telegram_id, "is_bot": False, "first_name": "Synthetic"},
             "message": {
-                "message_id": 17,
+                "message_id": message_id,
                 "date": 1,
                 "chat": {"type": "private", "id": telegram_id},
                 "from": {"id": 9999, "is_bot": True, "username": "synthetic_bot"},
@@ -89,6 +114,9 @@ def callback(action: str, *, telegram_id: int = 7001, query_id: str = "synthetic
             "data": action,
         },
     }
+    if source_text is not None:
+        update["callback_query"]["message"]["text"] = source_text
+    return update
 
 
 def button(action: str) -> str:
@@ -108,7 +136,7 @@ def bind(store: Store) -> None:
 
 
 def assert_guide(text: str, *, linked: bool = False) -> None:
-    assert text.startswith("Подключение к ChatGPT\n\nНастройки плагина\n")
+    assert text.startswith("Подключение к ChatGPT\n\nНастройки плагина\n\n")
     assert f"URL-адрес сервера: {PUBLIC_URL}\n" in text
     assert "Название: Telegram\n" in text
     assert "📎 Иконка PNG — файлом ниже." in text
@@ -209,8 +237,8 @@ def assert_code_placement(text: str, code: str) -> None:
     )
     offsets = [text.index(section) for section in sections]
     assert offsets == sorted(offsets)
-    assert "Аутентификация: OAuth\n\n🔑 Код подключения\n" in text
-    assert f"Код входа: {code}\nБез срока действия · одноразовый.\n" in text
+    assert "Аутентификация: OAuth\n\n🔑 Код подключения\n\n" in text
+    assert f"Код входа: {code}\n\nБез срока действия · одноразовый.\n" in text
     assert "10 минут" not in text
 
 
@@ -311,12 +339,11 @@ def test_missing_public_url_has_no_address_copy_or_download_button() -> None:
     assert all("url" not in button for row in keyboard["inline_keyboard"] for button in row)
 
 
-def test_menus_offer_only_commands_for_the_binding_and_do_not_share_mutable_entries() -> None:
-    assert [entry["command"] for entry in command_menu()] == ["connect"]
-    assert [entry["command"] for entry in command_menu(linked=True)] == ["connect", "unlink"]
+def test_command_menus_are_cleared_for_all_binding_states() -> None:
+    assert command_menu() == command_menu(linked=True) == []
     menu = command_menu()
-    menu[0]["command"] = "changed"
-    assert command_menu()[0]["command"] == "connect"
+    menu.append({"command": "changed", "description": "Synthetic"})
+    assert command_menu() == []
 
 
 def test_current_controls_keep_one_connect_path_and_no_pause_or_duplicate_navigation() -> None:
@@ -333,12 +360,14 @@ def test_current_controls_keep_one_connect_path_and_no_pause_or_duplicate_naviga
         "ui:help_claude",
         "ui:help_other",
         "ui:privacy",
+        "ui:details_back",
         "ui:unlink",
         "ui:unlink_confirm",
         "ui:cancel",
     }
     for linked in (False, True):
         keyboard = menu_keyboard(linked=linked)
+        assert "is_persistent" not in keyboard
         assert [item["text"] for row in keyboard["keyboard"] for item in row] == (
             ["🔌 Подключить AI-приложение", "🔗 Отключить всё"]
             if linked
@@ -1055,6 +1084,135 @@ async def test_buttons_select_client_before_enrollment_and_issue_only_own_fresh_
     assert len(store.list_users()) == 1
 
 
+async def test_client_selection_edits_picker_to_card_then_sends_icon_without_another_card(tmp_path):
+    store = Store(tmp_path / "picker-edit.sqlite3")
+    bot = FakeBot()
+    issued = []
+
+    def issue(user_key):
+        issued.append(user_key)
+        return "SYNTHETIC-🙂-CODE"
+
+    service = Service(
+        store, bot, "synthetic_bot", public_mcp_url=PUBLIC_URL, login_code_issuer=issue
+    )
+    await service.handle_update(command(button("ui:connect")))
+    picker = bot.sends[-1]
+
+    await service.handle_update(callback("ui:chatgpt", source_text=picker["text"], message_id=1))
+
+    assert bot.sends == [picker]
+    assert len(bot.edits) == 1
+    assert bot.edits[0]["message_id"] == 1
+    assert copy_buttons(bot.edits[0]["reply_markup"])["📋 Код"] == "SYNTHETIC-🙂-CODE"
+    assert len(issued) == len(bot.documents) == 1
+    assert bot.documents[0]["reply_markup"] == menu_keyboard(linked=True)
+
+
+@pytest.mark.parametrize("action", ["ui:help_chatgpt", "ui:privacy"])
+async def test_details_and_back_edit_one_message_without_rotating_code_or_sending_icon(
+    tmp_path, action
+):
+    store = Store(tmp_path / "detail-edit.sqlite3")
+    bind(store)
+    bot = FakeBot()
+
+    def forbidden(user_key):
+        pytest.fail("Details and Back must retain the already-issued code")
+
+    service = Service(
+        store, bot, "synthetic_bot", public_mcp_url=PUBLIC_URL, login_code_issuer=forbidden
+    )
+    code = "SYNTHETIC-🙂-<&_`>"
+    original = onboarding_text(PUBLIC_URL, login_code=code)
+
+    await service.handle_update(callback(action, source_text=original, message_id=23))
+
+    assert len(bot.edits) == 1
+    expanded = bot.edits[0]
+    assert expanded["message_id"] == 23
+    assert expanded["text"].startswith(original)
+    assert copy_buttons(expanded["reply_markup"])["📋 Код"] == code
+    assert any(entity_text(expanded["text"], item) == code for item in expanded["entities"])
+    assert "parse_mode" not in expanded
+    await service.handle_update(
+        callback("ui:details_back", source_text=expanded["text"], message_id=23)
+    )
+
+    assert len(bot.edits) == 2
+    collapsed = bot.edits[-1]
+    assert collapsed["message_id"] == 23
+    assert collapsed["text"] == original
+    assert (collapsed["entities"], collapsed["reply_markup"]) == onboarding_presentation(original)
+    assert bot.sends == bot.documents == bot.deleted == []
+
+
+@pytest.mark.parametrize(
+    ("edit_failure", "delete_failure", "replacement_count"),
+    [
+        (TelegramAPIError(400), None, 1),
+        (TelegramAPIError(400), TelegramAPIError(400), 0),
+        (TelegramAPIError(400), TelegramTransportError(), 0),
+        (TelegramTransportError(), None, 0),
+        (TelegramAPIError(403), None, 0),
+    ],
+)
+async def test_card_replacement_requires_known_edit_rejection_and_successful_removal(
+    setup, edit_failure, delete_failure, replacement_count
+):
+    service, store, bot = setup
+    bind(store)
+    bot.edit_failure = edit_failure
+    bot.delete_failure = delete_failure
+    source = onboarding_text(PUBLIC_URL, login_code="SYNTHETIC-CODE")
+
+    await service.handle_update(callback("ui:privacy", source_text=source, message_id=23))
+
+    assert len(bot.edits) == 1
+    assert len(bot.sends) == replacement_count
+    assert bot.documents == []
+    assert bot.deleted == (
+        [(7001, 23)]
+        if isinstance(edit_failure, TelegramAPIError) and edit_failure.code == 400
+        else []
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Unknown synthetic message",
+        "\nПодключение к ChatGPT\n\nSynthetic text",
+        "Подключение к ChatGPT\n\nsynthetic\x00text",
+        "Подключение к ChatGPT\n\n" + "🙂" * 2049,
+    ],
+)
+async def test_unknown_or_unbounded_callback_text_uses_safe_legacy_details(setup, source):
+    service, _, bot = setup
+
+    await service.handle_update(callback("ui:privacy", source_text=source))
+
+    assert bot.edits == bot.deleted == []
+    assert bot.sends[-1]["text"] == privacy_presentation()[0]
+
+
+async def test_current_keyboard_preserves_only_matching_unexpired_unlink_mode(setup, monkeypatch):
+    service, store, _ = setup
+    bind(store)
+    monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 100.0)
+    assert service.current_keyboard(7001) == menu_keyboard(linked=True)
+    await service.handle_update(command(button("ui:unlink")))
+    assert service.current_keyboard(7001) == unlink_keyboard()
+
+    monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 221.0)
+    assert service.current_keyboard(7001) == menu_keyboard(linked=True)
+    monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 100.0)
+    store.delete_user("synthetic")
+    replacement = store.create_link("replacement", "Replacement")
+    store.consume_link(replacement["token"], 7001, 7001, None, "Replacement")
+    assert service.current_keyboard(7001) == menu_keyboard(linked=True)
+
+
 @pytest.mark.parametrize(
     "action",
     [
@@ -1065,6 +1223,7 @@ async def test_buttons_select_client_before_enrollment_and_issue_only_own_fresh_
         "ui:help_claude",
         "ui:help_other",
         "ui:privacy",
+        "ui:details_back",
         "ui:cancel",
     ],
 )
@@ -1089,6 +1248,14 @@ async def test_navigation_never_enrolls_issues_codes_or_revokes(tmp_path, action
     assert bot.acknowledgements == ["synthetic-query"]
     if action.startswith("ui:help_"):
         assert bot.sends[-1]["text"] == help_presentation(action.removeprefix("ui:help_"))[0]
+    if action.startswith("ui:help_") or action == "ui:privacy":
+        message = bot.sends[-1]
+        assert message["entities"] == detail_entities(message["text"])
+        assert (
+            entity_text(message["text"], message["entities"][0])
+            == message["text"].split("\n", 1)[0]
+        )
+        assert "parse_mode" not in message
 
 
 @pytest.mark.parametrize("action", ["ui:chatgpt", "ui:stop", "ui:start", "ui:help", "ui:menu"])
@@ -1162,7 +1329,9 @@ async def test_callbacks_require_accessible_own_bot_message_in_senders_private_c
     assert store.list_users() == bot.sends == bot.documents == bot.acknowledgements == []
 
 
-@pytest.mark.parametrize("label", [*BUTTON_ACTIONS, "⏸ Пауза", "🔔 Включить", "ℹ️ Помощь"])
+@pytest.mark.parametrize(
+    "label", [*BUTTON_ACTIONS, *UNLINK_BUTTON_ACTIONS, "⏸ Пауза", "🔔 Включить", "ℹ️ Помощь"]
+)
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1265,6 +1434,90 @@ async def test_unlink_confirmation_only_revokes_current_senders_binding_once(set
     assert store.get_user("another") is not None
 
 
+async def test_unlink_form_reuses_one_message_and_reply_cancel_restores_main_keyboard(setup):
+    service, store, bot = setup
+    bind(store)
+
+    await service.handle_update(command(button("ui:unlink")))
+    form = bot.sends[-1]
+    assert "inline_keyboard" not in form["reply_markup"]
+    assert [item["text"] for row in form["reply_markup"]["keyboard"] for item in row] == [
+        "Отключить всё",
+        "Отмена",
+    ]
+    await service.handle_update(callback("ui:unlink"))
+    assert bot.sends == [form]
+
+    await service.handle_update(command("Отмена"))
+    assert bot.deleted == [(7001, 1)]
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True)
+    assert store.get_user("synthetic") is not None
+    await service.handle_update(command("Отключить всё"))
+    assert store.get_user("synthetic") is not None
+
+
+async def test_reply_confirmation_removes_form_and_restores_unlinked_main_keyboard(setup):
+    service, store, bot = setup
+    bind(store)
+    await service.handle_update(command(button("ui:unlink")))
+
+    await service.handle_update(command("Отключить всё"))
+
+    assert bot.deleted == [(7001, 1)]
+    assert store.get_user("synthetic") is None
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard()
+
+
+@pytest.mark.parametrize("failure", [TelegramAPIError(400), TelegramTransportError()])
+async def test_failed_form_removal_never_creates_another_confirmation(setup, failure):
+    service, store, bot = setup
+    bind(store)
+    await service.handle_update(command(button("ui:unlink")))
+    original = bot.sends[-1]
+    bot.delete_failure = failure
+
+    await service.handle_update(command("Отмена"))
+    await service.handle_update(command(button("ui:unlink")))
+
+    assert sum(message["text"] == original["text"] for message in bot.sends) == 1
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True)
+    await service.handle_update(command("Отключить всё"))
+    assert store.get_user("synthetic") is not None
+    bot.delete_failure = None
+    await service.handle_update(command(button("ui:unlink")))
+    assert sum(message["text"] == original["text"] for message in bot.sends) == 2
+
+
+async def test_unacknowledged_form_is_never_duplicated_or_used_to_revoke(setup):
+    service, store, bot = setup
+    bind(store)
+    bot.failure = TelegramTransportError()
+    await service.handle_update(command(button("ui:unlink")))
+    original = bot.sends[-1]
+    bot.failure = None
+
+    await service.handle_update(command(button("ui:unlink")))
+    await service.handle_update(command("Отключить всё"))
+
+    assert sum(message["text"] == original["text"] for message in bot.sends) == 1
+    assert bot.deleted == []
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True)
+    assert store.get_user("synthetic") is not None
+
+
+async def test_leaving_unlink_for_connect_removes_form_and_restores_keyboard_first(setup):
+    service, store, bot = setup
+    bind(store)
+    await service.handle_update(command(button("ui:unlink")))
+
+    await service.handle_update(command(button("ui:connect")))
+
+    assert bot.deleted == [(7001, 1)]
+    assert bot.sends[-2]["reply_markup"] == menu_keyboard(linked=True)
+    assert bot.sends[-1]["reply_markup"] == client_picker()[1]
+    assert store.get_user("synthetic") is not None
+
+
 @pytest.mark.parametrize("invalidator", ["cancel", "expired", "replacement"])
 async def test_unlink_confirmation_cancels_expires_and_cannot_revoke_replacement(
     setup, monkeypatch, invalidator
@@ -1286,14 +1539,19 @@ async def test_unlink_confirmation_cancels_expires_and_cannot_revoke_replacement
 
 
 async def test_unlink_confirmation_memory_is_bounded(setup, monkeypatch):
-    service, store, _ = setup
+    service, store, bot = setup
     bind(store)
     monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 100.0)
-    service._pending_unlinks = {key: ("synthetic-other", 200.0) for key in range(1, 1001)}
+    await service.handle_update(callback("ui:unlink"))
+    form = service._pending_unlinks.pop(7001)
+    service._pending_unlinks = {key: copy.copy(form) for key in range(1, 1001)}
+    before = list(bot.sends)
     await service.handle_update(callback("ui:unlink"))
     assert len(service._pending_unlinks) == 1000
-    assert 1 not in service._pending_unlinks
-    assert 7001 in service._pending_unlinks
+    assert 1 in service._pending_unlinks
+    assert 7001 not in service._pending_unlinks
+    assert len(bot.sends) == len(before) + 1
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True)
 
 
 async def test_unrecognized_updates_return_false_for_inbox_routing(setup):

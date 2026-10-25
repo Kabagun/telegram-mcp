@@ -3,6 +3,7 @@ import pytest
 from telegram_ping_mcp.onboarding import (
     BUTTON_ACTIONS,
     CALLBACK_ACTIONS,
+    UNLINK_BUTTON_ACTIONS,
     client_picker,
     help_presentation,
     intro_text,
@@ -10,6 +11,7 @@ from telegram_ping_mcp.onboarding import (
     onboarding_presentation,
     onboarding_text,
     privacy_presentation,
+    settings_details_presentation,
     unlink_presentation,
 )
 from telegram_ping_mcp.telegram import _validate_reply_markup
@@ -39,6 +41,7 @@ def test_all_menu_and_details_buttons_match_the_transport_and_static_actions():
         keyboard = menu_keyboard(linked=linked)
         _validate_reply_markup(keyboard)
         assert len(keyboard["keyboard"]) == (2 if linked else 1)
+        assert "is_persistent" not in keyboard
         for row in keyboard["keyboard"]:
             assert len(row) == 1
             assert all(item["text"] in BUTTON_ACTIONS for item in row)
@@ -80,3 +83,56 @@ def test_navigation_only_offers_actions_that_add_information_or_change_a_connect
     assert help_presentation("other")[1] is None
     assert privacy_presentation()[1] is None
     assert "все AI-приложения" in unlink_presentation()[0]
+    _, confirmation = unlink_presentation()
+    assert "inline_keyboard" not in confirmation
+    assert {button["text"] for row in confirmation["keyboard"] for button in row} == set(
+        UNLINK_BUTTON_ACTIONS
+    )
+
+
+@pytest.mark.parametrize("client", ["chatgpt", "claude", "other"])
+@pytest.mark.parametrize("section", ["help", "privacy"])
+def test_contextual_details_keep_exact_copy_values_and_utf16_entities_when_collapsed(
+    client, section
+):
+    endpoint = "https://пример.рф/🙂/mcp"
+    code = "SYNTHETIC-🙂-<&_`>"
+    base = onboarding_text(endpoint, login_code=code, client=client)
+    base_entities, base_markup = onboarding_presentation(base)
+    action = f"ui:help_{client}" if section == "help" else "ui:privacy"
+
+    text, entities, markup = settings_details_presentation(base, action, endpoint)
+
+    assert text.startswith(base + "\n\n")
+    _validate_reply_markup(markup)
+    assert len(markup["inline_keyboard"]) <= 4
+    assert all(len(row) <= 3 for row in markup["inline_keyboard"])
+    buttons = [button for row in markup["inline_keyboard"] for button in row]
+    assert {button["copy_text"]["text"] for button in buttons if "copy_text" in button} == {
+        "Telegram",
+        endpoint,
+        code,
+    }
+    assert [button["callback_data"] for button in buttons if "callback_data" in button] == [
+        "ui:details_back"
+    ]
+    encoded = text.encode("utf-16-le")
+    formatted = {
+        encoded[item["offset"] * 2 : (item["offset"] + item["length"]) * 2].decode(
+            "utf-16-le"
+        ): item["type"]
+        for item in entities
+    }
+    assert formatted[code] == "code"
+    assert formatted[endpoint] == "code"
+    heading = (
+        "Доступ и приватность"
+        if section == "privacy"
+        else help_presentation(client)[0].split("\n", 1)[0]
+    )
+    assert formatted[heading] == "bold"
+    assert settings_details_presentation(text, "ui:details_back", endpoint) == (
+        base,
+        base_entities,
+        base_markup,
+    )

@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .config import DEFAULT_API_BASE_URL, MAX_ATTACHMENT_BYTES, normalize_api_base_url
-from .onboarding import BUTTON_ACTIONS, CALLBACK_ACTIONS
+from .onboarding import BUTTON_ACTIONS, CALLBACK_ACTIONS, UNLINK_BUTTON_ACTIONS
 
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _FILE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\Z")
@@ -120,9 +120,9 @@ def _validate_reply_markup(reply_markup: object) -> None:
     invalid = "Telegram reply markup is invalid."
     if not isinstance(reply_markup, dict):
         raise ValueError(invalid)
-    is_reply_keyboard = set(reply_markup) == {"keyboard", "resize_keyboard", "is_persistent"}
+    is_reply_keyboard = set(reply_markup) == {"keyboard", "resize_keyboard"}
     if is_reply_keyboard:
-        if reply_markup["resize_keyboard"] is not True or reply_markup["is_persistent"] is not True:
+        if reply_markup["resize_keyboard"] is not True:
             raise ValueError(invalid)
         rows = reply_markup["keyboard"]
     elif set(reply_markup) == {"inline_keyboard"}:
@@ -138,7 +138,9 @@ def _validate_reply_markup(reply_markup: object) -> None:
             if not isinstance(button, dict) or not _valid_button_text(button.get("text"), 64):
                 raise ValueError(invalid)
             if is_reply_keyboard:
-                if set(button) != {"text"} or button["text"] not in BUTTON_ACTIONS:
+                if set(button) != {"text"} or button["text"] not in (
+                    BUTTON_ACTIONS | UNLINK_BUTTON_ACTIONS
+                ):
                     raise ValueError(invalid)
             elif set(button) == {"text", "copy_text"}:
                 copy_text = button["copy_text"]
@@ -327,12 +329,17 @@ class TelegramClient:
         reply_markup: dict[str, Any] | None = None,
         message_thread_id: int | None = None,
         reply_to_message_id: int | None = None,
+        disable_notification: bool = False,
     ) -> dict[str, Any]:
         """Send once using plain text unless explicit entities were supplied.
 
         Transport failures are deliberately not retried because delivery is ambiguous.
         """
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if not isinstance(disable_notification, bool):
+            raise ValueError("Telegram notification setting is invalid.")
+        if disable_notification:
+            payload["disable_notification"] = True
         if entities is not None:
             payload["entities"] = entities
         if reply_markup is not None:
@@ -358,6 +365,129 @@ class TelegramClient:
         ):
             # A success envelope with an unusable acknowledgement does not
             # prove that Telegram rejected the message. Never retry it.
+            raise TelegramTransportError()
+        return result
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        entities: list[dict[str, Any]] | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Edit one known bot message once without changing the chat's reply keyboard."""
+        if (
+            not _is_int(chat_id)
+            or not 1 <= chat_id <= 2**63 - 1
+            or not _is_int(message_id)
+            or not 1 <= message_id <= 2**63 - 1
+            or not isinstance(text, str)
+            or not text.strip()
+            or len(text) > 4096
+            or any(unicodedata.category(char) == "Cs" for char in text)
+            or len(text.encode("utf-16-le")) // 2 > 4096
+        ):
+            raise ValueError("Telegram message edit is invalid.")
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if entities is not None:
+            payload["entities"] = entities
+        if reply_markup is not None:
+            _validate_reply_markup(reply_markup)
+            if set(reply_markup) != {"inline_keyboard"}:
+                raise ValueError("Telegram edited message requires inline buttons.")
+            payload["reply_markup"] = reply_markup
+        result = await self._call("editMessageText", payload)
+        if (
+            not isinstance(result, dict)
+            or not _is_int(result.get("message_id"))
+            or result.get("message_id") != message_id
+            or not isinstance(result.get("chat"), dict)
+            or not _is_int(result["chat"].get("id"))
+            or result["chat"].get("id") != chat_id
+        ):
+            raise TelegramTransportError()
+        return result
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Delete one known bot message in a single attempt."""
+        if (
+            not _is_int(chat_id)
+            or not 1 <= chat_id <= 2**63 - 1
+            or not _is_int(message_id)
+            or not 1 <= message_id <= 2**63 - 1
+        ):
+            raise ValueError("Telegram message deletion is invalid.")
+        result = await self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        if result is not True:
+            raise TelegramAPIError(502)
+
+    async def send_document_bytes(
+        self,
+        chat_id: int,
+        data: bytes,
+        *,
+        file_name: str,
+        mime_type: str,
+        caption: str = "",
+        reply_to_message_id: int | None = None,
+        disable_notification: bool = False,
+    ) -> dict[str, Any]:
+        """Upload a bounded in-memory file once, with a plain-text caption."""
+        if (
+            not _is_int(chat_id)
+            or not 1 <= chat_id <= 2**63 - 1
+            or not isinstance(data, bytes)
+            or not 1 <= len(data) <= MAX_ATTACHMENT_BYTES
+            or not isinstance(file_name, str)
+            or not file_name.strip()
+            or len(file_name.encode("utf-8", errors="replace")) > 255
+            or "/" in file_name
+            or "\\" in file_name
+            or file_name in {".", ".."}
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in file_name)
+            or not isinstance(mime_type, str)
+            or len(mime_type) > 128
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*", mime_type
+            )
+            is None
+            or not isinstance(caption, str)
+            or len(caption) > 1024
+            or any(
+                unicodedata.category(char) == "Cs"
+                or (unicodedata.category(char) == "Cc" and char not in "\n\t")
+                for char in caption
+            )
+            or len(caption.encode("utf-16-le")) // 2 > 1024
+            or not isinstance(disable_notification, bool)
+        ):
+            raise ValueError("Telegram file upload is invalid.")
+        payload: dict[str, Any] = {"chat_id": chat_id, "caption": caption}
+        if disable_notification:
+            payload["disable_notification"] = True
+        if reply_to_message_id is not None:
+            if not _is_int(reply_to_message_id) or not 1 <= reply_to_message_id <= 2**63 - 1:
+                raise ValueError("Reply message identifier is invalid.")
+            payload["reply_parameters"] = json.dumps(
+                {"message_id": reply_to_message_id, "allow_sending_without_reply": False}
+            )
+        result = await self._call(
+            "sendDocument", payload, files={"document": (file_name, data, mime_type)}
+        )
+        if (
+            not isinstance(result, dict)
+            or not _is_int(result.get("message_id"))
+            or not 1 <= result["message_id"] <= 2**63 - 1
+            or not isinstance(result.get("chat"), dict)
+            or not _is_int(result["chat"].get("id"))
+            or result["chat"]["id"] != chat_id
+        ):
             raise TelegramTransportError()
         return result
 

@@ -23,6 +23,7 @@ class SyntheticBot:
         self.messages = []
         self.icons = []
         self.callback_answers = []
+        self.deleted = []
 
     async def get_me(self):
         return {"username": "synthetic_bot"}
@@ -41,6 +42,10 @@ class SyntheticBot:
     async def answer_callback_query(self, query_id, text=None):
         self.callback_answers.append(query_id)
         return None
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
     async def aclose(self):
         return None
@@ -226,7 +231,7 @@ async def test_button_runtime_keeps_controls_out_of_the_inbox(tmp_path):
 
     async with app.router.lifespan_context(app):
         await runtime.handle_update(incoming("/start", 1))
-        assert bot.messages[-1]["reply_markup"]["is_persistent"] is True
+        assert "is_persistent" not in bot.messages[-1]["reply_markup"]
         await runtime.handle_update(incoming("🔌 Подключить AI-приложение", 2))
         assert "Куда подключаем" in bot.messages[-1]["text"]
         assert runtime.service.find_users() == []
@@ -234,7 +239,7 @@ async def test_button_runtime_keeps_controls_out_of_the_inbox(tmp_path):
         assert bot.callback_answers == ["synthetic-choose"]
         assert bot.messages[-1]["text"].startswith("Подключение к Claude")
         assert "Код входа:" in bot.messages[-1]["text"]
-        assert bot.icons[-1]["reply_markup"]["is_persistent"] is True
+        assert "is_persistent" not in bot.icons[-1]["reply_markup"]
         assert runtime.inbox.list_messages() == []
         await runtime.handle_update(incoming("Synthetic actual inbox text", 3))
         assert len(runtime.inbox.list_messages()) == 1

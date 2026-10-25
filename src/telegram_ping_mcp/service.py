@@ -9,20 +9,25 @@ import logging
 import re
 import unicodedata
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
 from .onboarding import (
     BUTTON_ACTIONS,
     CALLBACK_ACTIONS,
+    UNLINK_BUTTON_ACTIONS,
     client_picker,
     command_menu,
+    detail_entities,
     help_presentation,
     intro_text,
     menu_keyboard,
     onboarding_presentation,
     onboarding_text,
     privacy_presentation,
+    settings_details_presentation,
+    unlink_keyboard,
     unlink_presentation,
 )
 from .store import Store
@@ -43,6 +48,8 @@ _INVALID_LINK = "Ссылка недействительна или устаре
 _LINKED = "Связь подтверждена."
 _UNLINKED = "Все ваши AI-приложения отключены. Подключиться заново можно кнопкой ниже."
 _UNLINK_RETRY = "Не удалось удалить привязку. Попробуйте ещё раз."
+_UNLINK_FORM_RETRY = "Не удалось обновить подтверждение. Попробуйте ещё раз."
+_UNLINK_CANCELLED = "Отключение отменено."
 _CONNECT = "Нажмите «🔌 Подключить AI-приложение», чтобы начать подключение."
 _CONNECT_RETRY = "Не удалось получить код входа. Нажмите «🔌 Подключить AI-приложение» ещё раз."
 _CONNECT_ICON_NOTE = "📎 Иконка PNG — файлом ниже."
@@ -69,6 +76,13 @@ _FORWARDED_FIELDS = {
 
 class ServiceError(ValueError):
     """A fixed, content-free error suitable for a public tool response."""
+
+
+@dataclass
+class _UnlinkForm:
+    user_key: str
+    expires_at: float
+    message_id: int | None
 
 
 def _safe_text(
@@ -136,7 +150,7 @@ class Service:
         onboarding_text(public_mcp_url)
         self._login_code_issuer = login_code_issuer
         self._user_unlinked = user_unlinked
-        self._pending_unlinks: dict[int, tuple[str, float]] = {}
+        self._pending_unlinks: dict[int, _UnlinkForm] = {}
 
     @property
     def store(self) -> Store:
@@ -399,6 +413,20 @@ class Service:
         user = self._store.get_user_by_telegram(telegram_id)
         return menu_keyboard(linked=user is not None)
 
+    def current_keyboard(self, telegram_id: int) -> dict[str, Any]:
+        """Preserve a live interaction keyboard when sending operator notices."""
+        telegram_id = _integer(telegram_id)
+        form = self._pending_unlinks.get(telegram_id)
+        user = self._store.get_user_by_telegram(telegram_id)
+        if (
+            form is not None
+            and form.expires_at > monotonic()
+            and user is not None
+            and form.user_key == user["user_key"]
+        ):
+            return unlink_keyboard()
+        return self._keyboard(telegram_id)
+
     @staticmethod
     def _private_author(message: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
         if any(field in message for field in _FORWARDED_FIELDS):
@@ -426,7 +454,9 @@ class Service:
         first_name = _safe_text(author.get("first_name", ""), maximum=128, allow_blank=True)
         return username, first_name
 
-    def _callback_control(self, query: object) -> tuple[str, int, dict[str, Any], str] | None:
+    def _callback_control(
+        self, query: object
+    ) -> tuple[str, int, dict[str, Any], str, dict[str, Any]] | None:
         if not isinstance(query, dict) or "inline_message_id" in query:
             return None
         query_id = query.get("id")
@@ -460,7 +490,7 @@ class Service:
         if private is None:
             return None
         telegram_id, author = private
-        return action, telegram_id, author, query_id
+        return action, telegram_id, author, query_id, message
 
     def _connect_text(self, telegram_id: int, *, client: str = "chatgpt") -> str:
         user = self._store.get_user_by_telegram(telegram_id)
@@ -484,7 +514,14 @@ class Service:
         except Exception:
             return f"{response}\n\n{_CONNECT_RETRY}"
 
-    async def _send_connect(self, telegram_id: int, author: dict[str, Any], *, client: str) -> None:
+    async def _send_connect(
+        self,
+        telegram_id: int,
+        author: dict[str, Any],
+        *,
+        client: str,
+        source_message: dict[str, Any] | None = None,
+    ) -> None:
         try:
             if self._login_code_issuer is not None:
                 username, first_name = self._author_profile(author)
@@ -504,13 +541,22 @@ class Service:
             response = f"{response}\n\n{_CONNECT_ICON_NOTE}"
         response = _message_text(response)
         entities, reply_markup = onboarding_presentation(response)
-        sent = await self._reply(
-            telegram_id,
-            response,
-            entities=entities,
-            reply_markup=reply_markup,
-            deactivate_on_forbidden=False,
-        )
+        if source_message is not None and source_message.get("text") == client_picker()[0]:
+            sent = await self._edit_control_message(
+                telegram_id,
+                source_message["message_id"],
+                response,
+                entities=entities,
+                reply_markup=reply_markup,
+            )
+        else:
+            sent = await self._reply(
+                telegram_id,
+                response,
+                entities=entities,
+                reply_markup=reply_markup,
+                deactivate_on_forbidden=False,
+            )
         if sent:
             try:
                 await self._bot.send_connector_icon(
@@ -533,22 +579,57 @@ class Service:
         *,
         token: str | None = None,
         legacy: bool = False,
+        source_message: dict[str, Any] | None = None,
     ) -> None:
         now = monotonic()
-        self._pending_unlinks = {
-            key: pending for key, pending in self._pending_unlinks.items() if pending[1] > now
-        }
-        pending = self._pending_unlinks.pop(telegram_id, None)
+        pending = self._pending_unlinks.get(telegram_id)
         user = self._store.get_user_by_telegram(telegram_id)
         confirming_unlink = (
             action == "ui:unlink_confirm"
             and pending is not None
+            and pending.expires_at > now
             and user is not None
-            and pending[0] == user["user_key"]
+            and pending.user_key == user["user_key"]
         )
+        if action == "ui:unlink" and not legacy:
+            await self._show_unlink_form(telegram_id, user, now)
+            return
+        if pending is not None:
+            await self._close_unlink_form(telegram_id)
+            if action in {
+                "ui:connect",
+                "ui:chatgpt",
+                "ui:claude",
+                "ui:other",
+                "ui:help_chatgpt",
+                "ui:help_claude",
+                "ui:help_other",
+                "ui:privacy",
+                "ui:details_back",
+            }:
+                await self._reply(
+                    telegram_id, _UNLINK_CANCELLED, reply_markup=self._keyboard(telegram_id)
+                )
+        if source_message is not None:
+            details = settings_details_presentation(
+                source_message.get("text"), action, self._public_mcp_url
+            )
+            if details is not None:
+                response, entities, markup = details
+                await self._edit_control_message(
+                    telegram_id,
+                    source_message["message_id"],
+                    response,
+                    entities=entities,
+                    reply_markup=markup,
+                )
+                return
         if action in {"ui:chatgpt", "ui:claude", "ui:other"} or (legacy and action == "ui:connect"):
             await self._send_connect(
-                telegram_id, author, client=action.removeprefix("ui:") if not legacy else "chatgpt"
+                telegram_id,
+                author,
+                client=action.removeprefix("ui:") if not legacy else "chatgpt",
+                source_message=source_message,
             )
             return
         if action == "ui:connect":
@@ -559,15 +640,10 @@ class Service:
             )
         elif action == "ui:privacy":
             response, markup = privacy_presentation()
-        elif action == "ui:unlink" and not legacy:
-            if user is not None:
-                if len(self._pending_unlinks) >= 1000:
-                    del self._pending_unlinks[next(iter(self._pending_unlinks))]
-                self._pending_unlinks[telegram_id] = (user["user_key"], now + 120)
-            response, markup = unlink_presentation()
         elif (
             (not legacy and action in _RETIRED_CALLBACKS)
             or action == "ui:cancel"
+            or action == "ui:details_back"
             or (action == "ui:unlink_confirm" and not confirming_unlink)
         ):
             response = intro_text(linked=self._store.get_user_by_telegram(telegram_id) is not None)
@@ -578,7 +654,101 @@ class Service:
         else:
             await self._management_control(action, telegram_id, author, token=token)
             return
-        await self._reply(telegram_id, response, reply_markup=markup)
+        await self._reply(
+            telegram_id, response, entities=detail_entities(response) or None, reply_markup=markup
+        )
+
+    async def _edit_control_message(
+        self,
+        telegram_id: int,
+        message_id: int,
+        text: str,
+        *,
+        entities: list[dict[str, Any]],
+        reply_markup: dict[str, Any] | None,
+    ) -> bool:
+        try:
+            result = await self._bot.edit_message_text(
+                telegram_id, message_id, text, entities=entities, reply_markup=reply_markup
+            )
+        except TelegramTransportError:
+            return False
+        except TelegramAPIError as error:
+            if error.code not in {400, 404}:
+                return False
+        else:
+            try:
+                return (
+                    isinstance(result, dict)
+                    and _integer(result.get("message_id")) == message_id
+                    and isinstance(result.get("chat"), dict)
+                    and _integer(result["chat"].get("id")) == telegram_id
+                )
+            except ServiceError:
+                return False
+        try:
+            await self._bot.delete_message(telegram_id, message_id)
+        except (TelegramAPIError, TelegramTransportError):
+            return False
+        return await self._reply(
+            telegram_id,
+            text,
+            entities=entities,
+            reply_markup=reply_markup,
+            deactivate_on_forbidden=False,
+        )
+
+    async def _close_unlink_form(self, telegram_id: int) -> bool:
+        form = self._pending_unlinks.get(telegram_id)
+        if form is None:
+            return True
+        form.expires_at = 0
+        if form.message_id is None:
+            return False
+        try:
+            await self._bot.delete_message(telegram_id, form.message_id)
+        except (TelegramAPIError, TelegramTransportError):
+            return False
+        self._pending_unlinks.pop(telegram_id, None)
+        return True
+
+    async def _show_unlink_form(
+        self, telegram_id: int, user: dict[str, Any] | None, now: float
+    ) -> None:
+        form = self._pending_unlinks.get(telegram_id)
+        if user is not None and form is not None and form.expires_at > 0:
+            if form.user_key == user["user_key"]:
+                form.expires_at = now + 120
+                return
+        removed = await self._close_unlink_form(telegram_id)
+        if user is None or not removed or len(self._pending_unlinks) >= 1000:
+            await self._reply(
+                telegram_id,
+                _UNLINK_FORM_RETRY if user is not None else _CONNECT,
+                reply_markup=self._keyboard(telegram_id),
+            )
+            return
+        response, markup = unlink_presentation()
+        form = _UnlinkForm(user["user_key"], now + 120, None)
+        self._pending_unlinks[telegram_id] = form
+        try:
+            result = await self._bot.send_message(
+                telegram_id, response, entities=detail_entities(response), reply_markup=markup
+            )
+            message_id = _integer(result.get("message_id"))
+            if not isinstance(result.get("chat"), dict):
+                raise ServiceError("Telegram confirmation acknowledgement is invalid.")
+            if _integer(result["chat"].get("id")) != telegram_id:
+                raise ServiceError("Telegram confirmation acknowledgement is invalid.")
+        except TelegramAPIError as error:
+            if error.code == 403:
+                self._store.set_active_by_telegram(telegram_id, False)
+            self._pending_unlinks.pop(telegram_id, None)
+        except (TelegramTransportError, ServiceError, AttributeError):
+            # An unacknowledged form may exist. Keep it closed so it cannot be duplicated.
+            form.expires_at = 0
+        else:
+            form.message_id = message_id
 
     async def _management_control(
         self, action: str, telegram_id: int, author: dict[str, Any], *, token: str | None
@@ -626,12 +796,12 @@ class Service:
             control = self._callback_control(update["callback_query"])
             if control is None:
                 return False
-            action, telegram_id, author, query_id = control
+            action, telegram_id, author, query_id, source_message = control
             try:
                 await self._bot.answer_callback_query(query_id)
             except (TelegramAPIError, TelegramTransportError):
                 logger.warning("Telegram callback acknowledgement could not be sent.")
-            await self._control(action, telegram_id, author)
+            await self._control(action, telegram_id, author, source_message=source_message)
             return True
         message = update.get("message")
         if not isinstance(message, dict):
@@ -643,7 +813,7 @@ class Service:
         text = message.get("text")
         if not isinstance(text, str):
             return False
-        action = BUTTON_ACTIONS.get(text)
+        action = BUTTON_ACTIONS.get(text) or UNLINK_BUTTON_ACTIONS.get(text)
         if action is not None:
             await self._control(action, telegram_id, author)
             return True

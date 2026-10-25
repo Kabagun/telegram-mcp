@@ -8,10 +8,129 @@ from importlib.resources import files
 import httpx
 
 from telegram_ping_mcp.oauth import OAuthProvider
-from telegram_ping_mcp.onboarding import menu_keyboard
+from telegram_ping_mcp.onboarding import menu_keyboard, onboarding_text, unlink_keyboard
 from telegram_ping_mcp.service import Service
 from telegram_ping_mcp.store import Store
 from telegram_ping_mcp.telegram import TelegramClient
+
+
+async def test_contextual_help_and_back_use_same_message_through_real_client_without_code_rotation(
+    tmp_path,
+):
+    calls = []
+    code = "SYNTHETIC-🙂-<&_`>"
+    endpoint = "https://connector.example.test/🙂/mcp"
+    original = onboarding_text(endpoint, login_code=code)
+
+    def api(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        payload = json.loads(request.content)
+        calls.append((method, payload))
+        result = (
+            True
+            if method == "answerCallbackQuery"
+            else {"message_id": payload["message_id"], "chat": {"id": 7001}}
+        )
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    def query(action, text):
+        return {
+            "callback_query": {
+                "id": "synthetic-callback",
+                "data": action,
+                "from": {"id": 7001, "is_bot": False},
+                "message": {
+                    "message_id": 23,
+                    "date": 1,
+                    "text": text,
+                    "chat": {"id": 7001, "type": "private"},
+                    "from": {"id": 9999, "is_bot": True, "username": "synthetic_bot"},
+                },
+            }
+        }
+
+    def forbidden(user_key):
+        raise AssertionError("Contextual details cannot issue another code")
+
+    store = Store(tmp_path / "contextual-wire.sqlite3")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+        service = Service(
+            store,
+            TelegramClient("123:synthetic-token", client=client),
+            "synthetic_bot",
+            public_mcp_url=endpoint,
+            login_code_issuer=forbidden,
+        )
+        await service.handle_update(query("ui:help_chatgpt", original))
+        expanded = calls[-1][1]
+        assert expanded["text"].startswith(original)
+        await service.handle_update(query("ui:details_back", expanded["text"]))
+
+    assert [method for method, _ in calls] == [
+        "answerCallbackQuery",
+        "editMessageText",
+        "answerCallbackQuery",
+        "editMessageText",
+    ]
+    for method, payload in calls:
+        if method != "editMessageText":
+            continue
+        assert payload["chat_id"] == 7001
+        assert payload["message_id"] == 23
+        assert "parse_mode" not in payload
+        buttons = [button for row in payload["reply_markup"]["inline_keyboard"] for button in row]
+        assert any(button.get("copy_text", {}).get("text") == code for button in buttons)
+    assert calls[-1][1]["text"] == original
+    assert store.list_users() == []
+
+
+async def test_unlink_reply_keyboard_removes_one_bound_form_and_restores_main_navigation(tmp_path):
+    calls = []
+
+    def api(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        payload = json.loads(request.content)
+        calls.append((method, payload))
+        result = (
+            True
+            if method in {"setMyCommands", "deleteMessage"}
+            else {"message_id": len(calls), "chat": {"id": 7001}}
+        )
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    def message(text):
+        return {
+            "message": {
+                "text": text,
+                "chat": {"id": 7001, "type": "private"},
+                "from": {"id": 7001, "is_bot": False, "first_name": "Synthetic"},
+            }
+        }
+
+    store = Store(tmp_path / "unlink-wire.sqlite3")
+    invite = store.create_link("synthetic", "Synthetic")
+    store.consume_link(invite["token"], 7001, 7001, None, "Synthetic")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+        service = Service(
+            store, TelegramClient("123:synthetic-token", client=client), "synthetic_bot"
+        )
+        await service.handle_update(message("🔗 Отключить всё"))
+        await service.handle_update(message("🔗 Отключить всё"))
+        assert len(calls) == 1
+        assert calls[0][1]["reply_markup"] == unlink_keyboard()
+        assert "parse_mode" not in calls[0][1]
+
+        await service.handle_update(message("Отмена"))
+        assert calls[1] == ("deleteMessage", {"chat_id": 7001, "message_id": 1})
+        assert calls[2][1]["reply_markup"] == menu_keyboard(linked=True)
+        assert store.get_user("synthetic") is not None
+
+        await service.handle_update(message("🔗 Отключить всё"))
+        await service.handle_update(message("Отключить всё"))
+        assert calls[5] == ("deleteMessage", {"chat_id": 7001, "message_id": 5})
+        assert calls[6][1]["reply_markup"] == menu_keyboard()
+        assert store.get_user("synthetic") is None
+        assert calls[-1][1]["commands"] == []
 
 
 async def test_client_callback_acknowledges_then_sends_guide_and_exact_png_through_real_client(

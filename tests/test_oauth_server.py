@@ -23,18 +23,10 @@ GROUP = -100123
 FILE_BYTES = b"Synthetic fixture attachment"
 TOOLS = {
     "get_profile",
-    "create_user_link",
-    "find_users",
-    "get_user",
-    "unlink_user",
-    "ping_user",
-    "ping_group",
-    "list_messages",
-    "get_message",
+    "get_profiles",
+    "get_messages",
     "get_attachment",
-    "reply_message",
-    "reply_attachment",
-    "mark_read",
+    "send_message",
 }
 
 
@@ -214,6 +206,73 @@ async def test_oauth_profile_id_survives_account_label_changes(server):
                 "nickname": "Chosen account name",
             }
         assert server.telegram.calls == []
+
+
+async def test_universal_send_runtime_keeps_private_target_reply_file_and_dedup(server):
+    async with server() as server:
+        async with connected(server, "alpha") as session:
+            assert payload(await session.call_tool("get_profiles", {})) == [
+                {"id": "7001", "name": "@synthetic_alpha", "nickname": "@synthetic_alpha"}
+            ]
+            assert payload(await session.call_tool("get_messages", {})) == [server.own]
+            arguments = {
+                "profile_id": "7001",
+                "request_id": "synthetic-universal-text",
+                "text": "Synthetic universal text",
+            }
+            sent = payload(await session.call_tool("send_message", arguments))
+            duplicate = payload(await session.call_tool("send_message", arguments))
+            assert sent["status"] == duplicate["status"] == "sent"
+            assert sent["request_id"] == duplicate["request_id"] == arguments["request_id"]
+            assert duplicate["duplicate"] is True
+            assert len(server.telegram.sends) == 1
+            assert server.telegram.sends[-1]["chat_id"] == 7001
+            reply = payload(
+                await session.call_tool(
+                    "send_message",
+                    {
+                        **arguments,
+                        "request_id": "synthetic-universal-reply",
+                        "message_id": server.own["id"],
+                    },
+                )
+            )
+            assert reply["status"] == "sent"
+            assert server.telegram.sends[-1]["reply_parameters"] == {
+                "message_id": server.own["telegram_message_id"],
+                "allow_sending_without_reply": False,
+            }
+            attachment = payload(
+                await session.call_tool(
+                    "send_message",
+                    {
+                        **arguments,
+                        "request_id": "synthetic-universal-file",
+                        "message_id": server.own["id"],
+                        "attachment_id": server.own["attachment"]["id"],
+                    },
+                )
+            )
+            assert attachment["status"] == "sent"
+            assert len(server.telegram.sends) == 3
+            assert server.telegram.sends[-1]["chat_id"] == 7001
+            assert server.telegram.sends[-1]["caption"] == arguments["text"]
+            assert server.telegram.sends[-1]["document"] == "synthetic-file-11"
+            assert server.telegram.downloads == 0
+            for denied in (
+                {"profile_id": "7002"},
+                {"message_id": server.foreign["id"]},
+                {"message_id": server.group["id"]},
+                {"attachment_id": server.foreign["attachment"]["id"]},
+                {"attachment_id": server.group["attachment"]["id"]},
+            ):
+                result = await session.call_tool(
+                    "send_message",
+                    {**arguments, "request_id": "synthetic-denied-universal", **denied},
+                )
+                assert result.isError
+                assert "Access denied." in result.content[0].text
+            assert len(server.telegram.sends) == 3
 
 
 async def test_oauth_tools_reject_foreign_and_group_resources_before_side_effects(server):
@@ -521,6 +580,9 @@ async def test_public_discovery_challenges_and_attachment_http_ownership(server)
 async def test_oauth_unlink_own_user_revokes_only_their_grant(server):
     async with server() as server:
         async with connected(server, "alpha") as session:
+            # Model a client that cached this retired tool before discovery was reduced.
+            # Refreshing schemas after unlink would correctly fail with the revoked grant.
+            session._tool_output_schemas["unlink_user"] = None
             assert payload(await session.call_tool("unlink_user", {"user_key": ALPHA}))["unlinked"]
         assert server.runtime.service.get_user(ALPHA) is None
         assert server.runtime.service.get_user(BETA) is not None
