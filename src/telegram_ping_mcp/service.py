@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from .onboarding import command_menu, intro_text, onboarding_text
@@ -28,7 +28,13 @@ _LINKED = "Связь подтверждена. Уведомления вклю�
 _STARTED = "Уведомления включены."
 _STOPPED = "Уведомления отключены. Чтобы включить их снова, отправьте /start."
 _UNLINKED = "Связь с вашим аккаунтом удалена. Для подключения потребуется новое приглашение."
+_UNLINK_RETRY = "Не удалось удалить привязку. Повторите /unlink."
 _CONNECT = "Для подключения используйте /connect."
+_CONNECT_STOPPED = (
+    "Сначала отправьте /start, чтобы включить подключение. "
+    "Затем /connect — получите код входа для AI-чата."
+)
+_CONNECT_RETRY = "Не удалось получить код входа. Повторите /connect."
 logger = logging.getLogger(__name__)
 _FORWARDED_FIELDS = {
     "forward_origin",
@@ -94,6 +100,8 @@ class Service:
         link_ttl_seconds: int = 900,
         allowed_group_chat_ids: frozenset[int] = frozenset(),
         public_mcp_url: str = "",
+        login_code_issuer: Callable[[str], str] | None = None,
+        user_unlinked: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(bot_username, str):
             raise ServiceError("Bot username is invalid.")
@@ -111,6 +119,9 @@ class Service:
         self._link_ttl_seconds = link_ttl_seconds
         self._allowed_group_chat_ids = allowed_group_chat_ids
         self._onboarding_text = onboarding_text(public_mcp_url)
+        self._linked_onboarding_text = onboarding_text(public_mcp_url, linked=True)
+        self._login_code_issuer = login_code_issuer
+        self._user_unlinked = user_unlinked
 
     @property
     def store(self) -> Store:
@@ -140,6 +151,11 @@ class Service:
 
     def unlink_user(self, user_key: str) -> dict[str, Any]:
         user_key = _safe_text(user_key, maximum=128)
+        if self._user_unlinked is not None and self._store.get_user(user_key) is not None:
+            try:
+                self._user_unlinked(user_key)
+            except Exception:
+                raise ServiceError("Could not unlink the user. Try again.") from None
         return {"user_key": user_key, "unlinked": self._store.delete_user(user_key)}
 
     def _binding(self, user_key: str) -> dict[str, Any]:
@@ -350,6 +366,29 @@ class Service:
         except (TelegramAPIError, TelegramTransportError):
             logger.warning("Telegram chat command menu could not be updated.")
 
+    def _connect_text(self, telegram_id: int) -> str:
+        user = self._store.get_user_by_telegram(telegram_id)
+        if user is None:
+            return self._onboarding_text
+        if user.get("active") is not True:
+            return _CONNECT_STOPPED
+        response = self._linked_onboarding_text
+        if self._login_code_issuer is None:
+            return response
+        try:
+            binding = self._binding(user["user_key"])
+            if binding["telegram_user_id"] != telegram_id:
+                raise ServiceError("User has no verified Telegram binding.")
+            if binding.get("active") is not True:
+                return _CONNECT_STOPPED
+            code = _safe_text(self._login_code_issuer(binding["user_key"]), maximum=128)
+            return _message_text(
+                f"{response}\n\nКод входа: {code}\n"
+                "Действует 10 минут. Скопируйте его в открывшееся окно подключения."
+            )
+        except Exception:
+            return f"{response}\n\n{_CONNECT_RETRY}"
+
     async def handle_update(self, update: dict[str, Any]) -> None:
         if not isinstance(update, dict) or not isinstance(update.get("message"), dict):
             return
@@ -380,7 +419,9 @@ class Service:
         if token is not None and name != "start":
             return
         if name == "connect":
-            await self._reply(telegram_id, self._onboarding_text, deactivate_on_forbidden=False)
+            await self._reply(
+                telegram_id, self._connect_text(telegram_id), deactivate_on_forbidden=False
+            )
             await self._refresh_commands(telegram_id)
             return
         if name == "start" and token is not None:
@@ -409,8 +450,14 @@ class Service:
         else:
             user = self._store.get_user_by_telegram(telegram_id)
             if user is not None:
-                self._store.delete_user(user["user_key"])
-            response = _UNLINKED
+                try:
+                    self.unlink_user(user["user_key"])
+                except ServiceError:
+                    response = _UNLINK_RETRY
+                else:
+                    response = _UNLINKED
+            else:
+                response = _UNLINKED
         if name == "start":
             introduction = intro_text(
                 linked=self._store.get_user_by_telegram(telegram_id) is not None

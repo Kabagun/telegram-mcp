@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sqlite3
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -9,7 +10,7 @@ import pytest
 from telegram_ping_mcp.config import Config, ConfigError
 from telegram_ping_mcp.onboarding import command_menu, onboarding_text
 from telegram_ping_mcp.server import Runtime
-from telegram_ping_mcp.service import Service
+from telegram_ping_mcp.service import Service, ServiceError
 from telegram_ping_mcp.store import Store
 from telegram_ping_mcp.telegram import TelegramAPIError, TelegramTransportError
 
@@ -66,18 +67,33 @@ def bind(store: Store) -> None:
     store.consume_link(link["token"], 7001, 7001, None, "Synthetic")
 
 
-def assert_guide(text: str) -> None:
+def assert_guide(text: str, *, linked: bool = False) -> None:
     assert "AI Connector" in text
     assert PUBLIC_URL in text
     assert "https://claude.ai/" in text
     assert "https://chatgpt.com/" in text
-    assert "Streamable HTTP" in text
-    assert "OAuth" in text
-    assert "прямое подключение сейчас недоступно" in text
-    assert "Authorization: Bearer <отдельный токен MCP>" in text
-    assert "ключ API модели боту не нужен" in text
-    assert "Бот сам не пробуждает AI-чат" in text
+    assert "откройте плагины и добавьте AI Connector" in text
+    assert "настройки → Connectors → Add custom connector" in text
+    assert "введите код из бота и разрешите доступ" in text
+    assert ("личное приглашение" in text) is not linked
+    assert ("нажмите Start" in text) is not linked
+    assert text.count("https://") == 3
+    for removed in (
+        "Streamable",
+        "HTTP",
+        "OAuth",
+        "Bearer",
+        "Authorization",
+        "API",
+        "токен",
+        "недоступно",
+        "support.claude.com",
+        "developers.openai.com",
+        "learn.chatgpt.com",
+    ):
+        assert removed not in text
     assert "/help" not in text
+    assert len(text) < 750
     assert len(text.encode("utf-16-le")) // 2 <= 4096
 
 
@@ -98,7 +114,7 @@ def assert_intro(text: str, *, linked: bool) -> None:
     assert "AI Connector" in text
     assert "уведомления и сообщения" in text
     assert "читать ваши ответы и файлы" in text
-    assert "Модель выбирается в AI-приложении" in text
+    assert "Модель" not in text
     assert "/connect" in text
     assert ("/stop" in text) is linked
     assert ("/unlink" in text) is linked
@@ -156,12 +172,172 @@ async def test_connect_is_available_without_changing_binding_or_optin(setup, act
     before = service.find_users()
     await service.handle_update(command(text))
     assert len(bot.sends) == 1
-    assert bot.sends[0]["text"] == onboarding_text(PUBLIC_URL)
+    response = bot.sends[0]["text"]
+    if active is False:
+        assert "/start" in response
+        assert "/connect" in response
+        assert "код входа" in response
+        assert "Код входа:" not in response
+        assert len(response) < 150
+    else:
+        assert response == onboarding_text(PUBLIC_URL, linked=active is True)
+        assert_guide(response, linked=active is True)
     assert service.find_users() == before
-    assert_guide(bot.sends[0]["text"])
     assert bot.command_menus == [
         {"commands": command_menu(linked=active is not None), "chat_id": 7001}
     ]
+
+
+async def test_connect_issues_fresh_codes_only_in_replies_and_keeps_binding(tmp_path) -> None:
+    database = tmp_path / "login-code.sqlite3"
+    store = Store(database)
+    bind(store)
+    bot = FakeBot()
+    issued_for = []
+
+    def issue(user_key):
+        issued_for.append(user_key)
+        return f"synthetic-code-{len(issued_for)}"
+
+    service = Service(
+        store, bot, "synthetic_bot", public_mcp_url=PUBLIC_URL, login_code_issuer=issue
+    )
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+    for index in range(1, 3):
+        await service.handle_update(command("/connect"))
+        response = bot.sends[-1]["text"]
+        assert_guide(response, linked=True)
+        assert f"Код входа: synthetic-code-{index}" in response
+        assert "Действует 10 минут" in response
+        assert "Скопируйте его в открывшееся окно подключения" in response
+    assert "synthetic-code-1" not in bot.sends[-1]["text"]
+    assert issued_for == ["synthetic", "synthetic"]
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+    assert service.get_user("synthetic")["active"] is True
+
+
+@pytest.mark.parametrize("active", [None, False])
+async def test_connect_does_not_issue_codes_without_active_binding_or_consume_invite(
+    tmp_path, active
+) -> None:
+    store = Store(tmp_path / "inactive-code.sqlite3")
+    if active is False:
+        bind(store)
+        store.set_active_by_telegram(7001, False)
+    bot = FakeBot()
+
+    def issue(user_key):
+        pytest.fail("Login codes require a verified active binding")
+
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
+    invite = service.create_user_link("synthetic", "Synthetic")
+    token = parse_qs(urlsplit(invite["link"]).query)["start"][0]
+    before = service.find_users()
+    await service.handle_update(command("/connect"))
+    assert service.find_users() == before
+    assert "Код входа:" not in bot.sends[-1]["text"]
+    await service.handle_update(command(f"/start {token}"))
+    assert service.get_user("synthetic")["active"] is True
+
+
+async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(
+    tmp_path, caplog
+) -> None:
+    store = Store(tmp_path / "code-failure.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    calls = []
+
+    def issue(user_key):
+        calls.append(user_key)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic-private-error")
+        return "synthetic-retry-code"
+
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
+    before = service.find_users()
+    await service.handle_update(command("/connect"))
+    assert "Не удалось получить код входа. Повторите /connect." in bot.sends[-1]["text"]
+    assert "synthetic-private-error" not in bot.sends[-1]["text"]
+    assert "synthetic-private-error" not in caplog.text
+    assert "Код входа:" not in bot.sends[-1]["text"]
+    assert service.find_users() == before
+    await service.handle_update(command("/connect"))
+    assert "Код входа: synthetic-retry-code" in bot.sends[-1]["text"]
+    assert calls == ["synthetic", "synthetic"]
+
+
+@pytest.mark.parametrize("code", [None, "", "x" * 129, "synthetic\nprivate", "\ud800"])
+async def test_invalid_issued_code_uses_safe_retry_response(tmp_path, code) -> None:
+    store = Store(tmp_path / "invalid-code.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=lambda user_key: code)
+    await service.handle_update(command("/connect"))
+    assert bot.sends[-1]["text"].endswith("Не удалось получить код входа. Повторите /connect.")
+    assert "Код входа:" not in bot.sends[-1]["text"]
+
+
+@pytest.mark.parametrize("through_bot", [False, True])
+async def test_unlink_revokes_access_before_removing_binding(tmp_path, through_bot) -> None:
+    store = Store(tmp_path / "unlink-revoke.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    revoked = []
+
+    def revoke(user_key):
+        assert store.get_user(user_key) is not None
+        revoked.append(user_key)
+
+    service = Service(store, bot, "synthetic_bot", user_unlinked=revoke)
+    if through_bot:
+        await service.handle_update(command("/unlink"))
+        assert bot.sends[-1]["text"].startswith("Связь с вашим аккаунтом удалена.")
+        assert bot.command_menus[-1]["commands"] == command_menu()
+    else:
+        assert service.unlink_user("synthetic") == {"user_key": "synthetic", "unlinked": True}
+    assert revoked == ["synthetic"]
+    assert service.get_user("synthetic") is None
+    assert service.unlink_user("synthetic") == {"user_key": "synthetic", "unlinked": False}
+    assert revoked == ["synthetic"]
+
+
+@pytest.mark.parametrize("through_bot", [False, True])
+async def test_unlink_revocation_failure_retains_binding_and_allows_safe_retry(
+    tmp_path, caplog, through_bot
+) -> None:
+    store = Store(tmp_path / "unlink-revoke-failure.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    calls = []
+
+    def revoke(user_key):
+        calls.append(user_key)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic-private-revocation-error")
+
+    service = Service(store, bot, "synthetic_bot", user_unlinked=revoke)
+    before = service.find_users()
+    if through_bot:
+        await service.handle_update(command("/unlink"))
+        assert bot.sends[-1]["text"] == "Не удалось удалить привязку. Повторите /unlink."
+        assert bot.command_menus[-1]["commands"] == command_menu(linked=True)
+    else:
+        with pytest.raises(ServiceError) as caught:
+            service.unlink_user("synthetic")
+        assert str(caught.value) == "Could not unlink the user. Try again."
+    assert service.find_users() == before
+    assert "synthetic-private-revocation-error" not in caplog.text
+    assert all("synthetic-private-revocation-error" not in sent["text"] for sent in bot.sends)
+    if through_bot:
+        await service.handle_update(command("/unlink"))
+        assert bot.sends[-1]["text"].startswith("Связь с вашим аккаунтом удалена.")
+    else:
+        assert service.unlink_user("synthetic")["unlinked"] is True
+    assert service.get_user("synthetic") is None
+    assert calls == ["synthetic", "synthetic"]
 
 
 async def test_connect_reply_failure_does_not_change_optin(tmp_path) -> None:
@@ -211,7 +387,13 @@ async def test_connect_ignores_other_bots_arguments_and_ordinary_text(setup, tex
     ],
 )
 async def test_untrusted_connect_updates_cannot_trigger_replies_or_menus(setup, mutation) -> None:
-    service, _, bot = setup
+    _, store, bot = setup
+    bind(store)
+
+    def issue(user_key):
+        pytest.fail("Untrusted updates must not issue login codes")
+
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
     update = command("/connect")
     update["message"].update(copy.deepcopy(mutation))
     await service.handle_update(update)
@@ -302,10 +484,10 @@ async def test_runtime_menu_failure_leaves_ready_and_chat_commands_can_recover(
         assert bot.command_menus[-1] == {"commands": command_menu(), "chat_id": 7001}
 
 
-def test_missing_public_url_uses_admin_instructions() -> None:
+def test_missing_public_url_uses_owner_instructions() -> None:
     assert Config.from_env({}).public_mcp_url == ""
     text = onboarding_text()
-    assert "Адрес MCP и доступ получите у администратора" in text
+    assert "Адрес подключения запросите у владельца" in text
     assert "https://connector.example.test" not in text
 
 
@@ -378,7 +560,16 @@ async def test_longest_public_url_and_connect_guide_fit_one_telegram_message(
     url = prefix + suffix
     assert len(url.encode("utf-16-le")) // 2 == 2048
     bot = FakeBot()
-    service = Service(Store(tmp_path / "length.sqlite3"), bot, "synthetic_bot", public_mcp_url=url)
+    store = Store(tmp_path / "length.sqlite3")
+    bind(store)
+    service = Service(
+        store,
+        bot,
+        "synthetic_bot",
+        public_mcp_url=url,
+        login_code_issuer=lambda user_key: "🙂" * 128,
+    )
     await service.handle_update(command("/connect"))
     assert url in bot.sends[0]["text"]
+    assert "Код входа:" in bot.sends[0]["text"]
     assert len(bot.sends[0]["text"].encode("utf-16-le")) // 2 <= 4096
