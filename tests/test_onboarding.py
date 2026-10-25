@@ -283,7 +283,7 @@ def test_menus_offer_only_commands_for_the_binding_and_do_not_share_mutable_entr
 
 
 def assert_intro(text: str, *, linked: bool) -> None:
-    assert "iConnector соединяет Telegram с вашим AI-чатом." in text
+    assert "AI Connector соединяет Telegram с вашим AI-чатом." in text
     assert "уведомления и сообщения" in text
     assert "читать ваши ответы и файлы" in text
     assert "Модель" not in text
@@ -297,7 +297,7 @@ def assert_intro(text: str, *, linked: bool) -> None:
 async def test_start_is_short_and_keeps_only_relevant_binding_status(setup) -> None:
     service, store, bot = setup
     await service.handle_update(command("/start"))
-    assert bot.sends[-1]["text"].startswith("iConnector")
+    assert bot.sends[-1]["text"].startswith("AI Connector")
     assert "администратор" not in bot.sends[-1]["text"]
     assert "ссылку-приглашение" not in bot.sends[-1]["text"]
     assert service.find_users() == []
@@ -580,7 +580,7 @@ async def test_optout_commands_remain_concise(setup, text) -> None:
     bind(store)
     await service.handle_update(command(text))
     assert len(bot.sends) == 1
-    assert "iConnector" not in bot.sends[0]["text"]
+    assert "AI Connector" not in bot.sends[0]["text"]
     assert len(bot.sends[0]["text"]) < 150
     assert service.get_user("synthetic") is None or not service.get_user("synthetic")["active"]
     assert bot.command_menus[-1]["commands"] == command_menu(linked=text != "/unlink")

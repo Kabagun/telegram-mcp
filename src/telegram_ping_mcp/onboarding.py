@@ -137,7 +137,7 @@ def intro_text(*, linked: bool) -> str:
         else "Чтобы подключить AI-чат, используйте /connect."
     )
     return (
-        "iConnector соединяет Telegram с вашим AI-чатом. Чат может присылать "
+        "AI Connector соединяет Telegram с вашим AI-чатом. Чат может присылать "
         "уведомления и сообщения, читать ваши ответы и файлы.\n\n" + actions
     )
 
