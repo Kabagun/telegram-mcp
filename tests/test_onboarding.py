@@ -8,7 +8,12 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from telegram_ping_mcp.config import Config, ConfigError
-from telegram_ping_mcp.onboarding import command_menu, onboarding_text
+from telegram_ping_mcp.onboarding import (
+    PRIVACY_NOTICE,
+    command_menu,
+    onboarding_presentation,
+    onboarding_text,
+)
 from telegram_ping_mcp.server import Runtime
 from telegram_ping_mcp.service import Service, ServiceError
 from telegram_ping_mcp.store import Store
@@ -22,6 +27,7 @@ class FakeBot:
         self, *, failure: Exception | None = None, menu_failure: Exception | None = None
     ) -> None:
         self.sends: list[dict] = []
+        self.documents: list[dict] = []
         self.command_menus: list[dict] = []
         self.failure = failure
         self.menu_failure = menu_failure
@@ -33,7 +39,11 @@ class FakeBot:
         self.sends.append({"chat_id": chat_id, "text": text, **kwargs})
         if self.failure is not None:
             raise self.failure
-        return {"message_id": len(self.sends)}
+        return {"message_id": len(self.sends), "chat": {"id": chat_id}}
+
+    async def send_connector_icon(self, chat_id: int) -> dict:
+        self.documents.append({"chat_id": chat_id})
+        return {"message_id": len(self.sends) + len(self.documents), "chat": {"id": chat_id}}
 
     async def set_commands(self, commands: list[dict], *, chat_id: int | None = None) -> None:
         self.command_menus.append({"commands": copy.deepcopy(commands), "chat_id": chat_id})
@@ -72,25 +82,25 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     assert f"URL-адрес сервера: {PUBLIC_URL}\n" in text
     assert "https://claude.ai/" in text
     assert "https://chatgpt.com/" in text
-    assert "Плагины → + → Добавить пользовательский сервер MCP" in text
+    assert "Плагины → +\nДобавить пользовательский сервер MCP" in text
     assert "Название: AI Connector\n" in text
     assert "Описание: Уведомления, ответы и файлы через Telegram-бота." in text
-    assert "Значок: скачайте PNG https://connector.example.test/assets/telegram-icon.png" in text
-    assert "и загрузите файл (256×256, до 10 КБ)" in text
-    assert "Подключение: выберите «URL-адрес сервера»" in text
+    assert "📎 Иконка PNG — файлом ниже." in text
+    assert "Загрузите её в «Значок» (256×256, до 10 КБ)" in text
+    assert "Подключение: URL-адрес сервера" in text
     assert "Аутентификация: OAuth" in text
-    assert "В расширенных настройках оставьте DCR и telegram" in text
-    assert "Остальные поля заполнятся автоматически; Client ID и Client Secret не нужны" in text
-    assert "OIDC не включайте" in text
-    assert "Отметьте «Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
+    assert "DCR: автоматически\nScope: telegram" in text
+    assert "Client ID и Client Secret: не нужны" in text
+    assert "OIDC: выключен" in text
+    assert "«Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
     assert "Установите плагин" in text
-    assert "в AI-чате выберите @AI Connector" in text
+    assert "В AI-чате выберите @AI Connector" in text
     assert "Settings → Connectors → Add custom connector" in text
     assert "введите код из бота и разрешите доступ" in text
     assert ("личное приглашение" in text) is not linked
     assert ("нажмите Start" in text) is not linked
     assert ("Затем отправьте /connect, чтобы получить код входа" in text) is not linked
-    assert text.count("https://") == 4
+    assert text.count("https://") == 3
     for removed in (
         "Streamable",
         "Bearer",
@@ -105,7 +115,6 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     ):
         assert removed not in text
     assert "/help" not in text
-    assert len(text) < 1800
     assert len(text.encode("utf-16-le")) // 2 <= 4096
 
 
@@ -119,6 +128,11 @@ def test_guide_explains_bot_chat_access_and_user_consent_without_absolute_securi
     assert "Другие пользователи не видят ваши данные" in text
     assert "Передача защищена HTTPS, доступ подтверждаете вы" in text
     assert "Отключить — /unlink" in text
+    privacy = text.split("🔒 Доступ и приватность\n", 1)[1]
+    bullets = privacy.splitlines()
+    assert len(bullets) == 4
+    assert all(line.startswith("• ") for line in bullets)
+    assert " ".join(line.removeprefix("• ") for line in bullets) == PRIVACY_NOTICE
     for claim in ("сквозное шифрование", "end-to-end", "полностью безопас", "не имеет доступа"):
         assert claim not in text
 
@@ -138,8 +152,121 @@ def test_guide_explains_bot_chat_access_and_user_consent_without_absolute_securi
 def test_icon_download_uses_public_endpoint_origin(endpoint, icon_url) -> None:
     text = onboarding_text(endpoint, linked=True)
     assert f"URL-адрес сервера: {endpoint}\n" in text
-    assert f"Значок: скачайте PNG {icon_url} и загрузите файл (256×256, до 10 КБ)." in text
+    _, keyboard = onboarding_presentation(text)
+    assert keyboard["inline_keyboard"][-1] == [{"text": "Скачать PNG", "url": icon_url}]
+    assert "📎 Иконка PNG — файлом ниже." in text
+    assert icon_url not in text
     assert text.count(endpoint) == 1
+
+
+def entity_text(text: str, entity: dict) -> str:
+    start = entity["offset"] * 2
+    end = start + entity["length"] * 2
+    return text.encode("utf-16-le")[start:end].decode("utf-16-le")
+
+
+def copy_buttons(keyboard: dict) -> dict[str, str]:
+    return {
+        button["text"]: button["copy_text"]["text"]
+        for row in keyboard["inline_keyboard"]
+        for button in row
+        if "copy_text" in button
+    }
+
+
+@pytest.mark.parametrize("code", ["synthetic-🙂-<&_`>", "synthetic\u2028🙂\u2029code"])
+def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji(code) -> None:
+    endpoint = "https://пример.рф/подключение/🙂/mcp"
+    text = onboarding_text(endpoint, linked=True) + f"\n\nКод входа: {code}\nДействует 10 минут."
+    entities, keyboard = onboarding_presentation(text)
+    assert keyboard is not None
+    expected = {
+        "📋 Название": "AI Connector",
+        "📋 Описание": "Уведомления, ответы и файлы через Telegram-бота.",
+        "📋 Адрес": endpoint,
+        "📋 Код": code,
+    }
+    assert copy_buttons(keyboard) == expected
+    assert {entity_text(text, item) for item in entities if item["type"] == "code"} == set(
+        expected.values()
+    )
+    assert [entity_text(text, item) for item in entities if item["type"] == "bold"] == [
+        "1️⃣ Откройте ChatGPT",
+        "2️⃣ Заполните поля",
+        "3️⃣ Проверьте настройки",
+        "4️⃣ Завершите подключение",
+        "Claude",
+        "🔒 Доступ и приватность",
+    ]
+    for value in (endpoint, code):
+        item = next(item for item in entities if entity_text(text, item) == value)
+        assert item["offset"] == len(text[: text.index(value)].encode("utf-16-le")) // 2
+        assert item["length"] == len(value.encode("utf-16-le")) // 2
+    previous_end = 0
+    for item in entities:
+        assert item["offset"] >= previous_end
+        previous_end = item["offset"] + item["length"]
+    assert len(keyboard["inline_keyboard"]) <= 4
+    assert all(1 <= len(row) <= 3 for row in keyboard["inline_keyboard"])
+    assert all(item["type"] in {"bold", "code"} for item in entities)
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_presentation_without_a_login_code_has_no_code_button(linked) -> None:
+    _, keyboard = onboarding_presentation(onboarding_text(PUBLIC_URL, linked=linked))
+    assert keyboard is not None
+    assert "📋 Код" not in copy_buttons(keyboard)
+
+
+def test_presentation_does_not_format_unknown_lines_or_unlinked_login_codes() -> None:
+    extra = (
+        "\n\nПользовательский заголовок 🙂\nНазвание: Другое имя\nОписание: Другой текст\n"
+        "URL-адрес сервера: http://unsafe.example.test/mcp\nКод входа: synthetic-unlinked"
+    )
+    text = onboarding_text(PUBLIC_URL) + extra
+    entities, keyboard = onboarding_presentation(text)
+    assert keyboard is not None
+    assert "📋 Код" not in copy_buttons(keyboard)
+    assert all(
+        item["offset"] + item["length"] <= len(text[: -len(extra)].encode("utf-16-le")) // 2
+        for item in entities
+    )
+    assert copy_buttons(keyboard)["📋 Адрес"] == PUBLIC_URL
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "Сначала отправьте /start, чтобы включить подключение.\n📎 Иконка PNG — файлом ниже.",
+        "Уведомления отключены.",
+        "Название: AI Connector\nКод входа: synthetic-code",
+    ],
+)
+def test_presentation_keeps_short_statuses_plain(status) -> None:
+    assert onboarding_presentation(status) == ([], None)
+
+
+@pytest.mark.parametrize("length", [256, 257, 2048])
+def test_presentation_omits_only_address_copy_button_over_256_utf16_units(length) -> None:
+    prefix = "https://example.test/"
+    endpoint = prefix + "🙂" * ((length - len(prefix)) // 2) + "x" * ((length - len(prefix)) % 2)
+    code = "🙂" * 128
+    text = onboarding_text(endpoint, linked=True) + f"\n\nКод входа: {code}"
+    entities, keyboard = onboarding_presentation(text)
+    assert keyboard is not None
+    buttons = copy_buttons(keyboard)
+    assert ("📋 Адрес" in buttons) is (length <= 256)
+    assert buttons["📋 Код"] == code
+    assert any(entity_text(text, item) == endpoint for item in entities)
+    assert any(entity_text(text, item) == code for item in entities)
+    assert all(1 <= len(value.encode("utf-16-le")) // 2 <= 256 for value in buttons.values())
+
+
+def test_missing_public_url_has_no_address_copy_or_download_button() -> None:
+    _, keyboard = onboarding_presentation(onboarding_text())
+    assert keyboard is not None
+    assert set(copy_buttons(keyboard)) == {"📋 Название", "📋 Описание"}
+    assert all("url" not in button for row in keyboard["inline_keyboard"] for button in row)
 
 
 def test_menus_offer_only_commands_for_the_binding_and_do_not_share_mutable_entries() -> None:
@@ -223,7 +350,7 @@ async def test_connect_is_available_without_changing_binding_or_optin(setup, act
         assert "/connect" in response
         assert "код входа" in response
         assert "Код входа:" not in response
-        assert len(response) < 150
+        assert len(response) < 200
     else:
         assert response == onboarding_text(PUBLIC_URL, linked=active is True)
         assert_guide(response, linked=active is True)
@@ -533,7 +660,7 @@ def test_missing_public_url_uses_owner_instructions() -> None:
     assert Config.from_env({}).public_mcp_url == ""
     text = onboarding_text()
     assert "URL-адрес сервера: адрес подключения запросите у владельца." in text
-    assert "Значок: PNG-иконку запросите у владельца." in text
+    assert "📎 Иконка PNG — файлом ниже." in text
     assert "telegram-icon.png" not in text
     assert "https://connector.example.test" not in text
 

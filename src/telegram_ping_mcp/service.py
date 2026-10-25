@@ -11,7 +11,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from .onboarding import command_menu, intro_text, onboarding_text
+from .onboarding import command_menu, intro_text, onboarding_presentation, onboarding_text
 from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
@@ -35,6 +35,10 @@ _CONNECT_STOPPED = (
     "Затем /connect — получите код входа для AI-чата."
 )
 _CONNECT_RETRY = "Не удалось получить код входа. Повторите /connect."
+_CONNECT_ICON_NOTE = "📎 Иконка PNG — файлом ниже."
+_CONNECT_ICON_RETRY = (
+    "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите /connect."
+)
 logger = logging.getLogger(__name__)
 _FORWARDED_FIELDS = {
     "forward_origin",
@@ -348,16 +352,30 @@ class Service:
         )
 
     async def _reply(
-        self, telegram_id: int, text: str, *, deactivate_on_forbidden: bool = True
-    ) -> None:
+        self,
+        telegram_id: int,
+        text: str,
+        *,
+        entities: list[dict[str, Any]] | None = None,
+        reply_markup: dict[str, Any] | None = None,
+        deactivate_on_forbidden: bool = True,
+    ) -> bool:
+        options: dict[str, Any] = {}
+        if entities is not None:
+            options["entities"] = entities
+        if reply_markup is not None:
+            options["reply_markup"] = reply_markup
         try:
-            await self._bot.send_message(telegram_id, text)
+            await self._bot.send_message(telegram_id, text, **options)
         except TelegramAPIError as error:
             if error.code == 403 and deactivate_on_forbidden:
                 self._store.set_active_by_telegram(telegram_id, False)
         except TelegramTransportError:
             # The command's durable state is already applied. Never retry the reply.
             pass
+        else:
+            return True
+        return False
 
     async def _refresh_commands(self, telegram_id: int) -> None:
         linked = self._store.get_user_by_telegram(telegram_id) is not None
@@ -383,7 +401,7 @@ class Service:
                 return _CONNECT_STOPPED
             code = _safe_text(self._login_code_issuer(binding["user_key"]), maximum=128)
             return _message_text(
-                f"{response}\n\nКод входа: {code}\n"
+                f"{response}\n\n🔑 Код подключения\nКод входа: {code}\n"
                 "Действует 10 минут. Скопируйте его в открывшееся окно подключения."
             )
         except Exception:
@@ -419,9 +437,25 @@ class Service:
         if token is not None and name != "start":
             return
         if name == "connect":
-            await self._reply(
-                telegram_id, self._connect_text(telegram_id), deactivate_on_forbidden=False
+            response = self._connect_text(telegram_id)
+            if _CONNECT_ICON_NOTE not in response:
+                response = f"{response}\n\n{_CONNECT_ICON_NOTE}"
+            response = _message_text(response)
+            entities, reply_markup = onboarding_presentation(response)
+            sent = await self._reply(
+                telegram_id,
+                response,
+                entities=entities,
+                reply_markup=reply_markup,
+                deactivate_on_forbidden=False,
             )
+            if sent:
+                try:
+                    await self._bot.send_connector_icon(telegram_id)
+                except (TelegramAPIError, TelegramTransportError, OSError, ValueError):
+                    await self._reply(
+                        telegram_id, _CONNECT_ICON_RETRY, deactivate_on_forbidden=False
+                    )
             await self._refresh_commands(telegram_id)
             return
         if name == "start" and token is not None:

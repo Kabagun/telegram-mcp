@@ -5,8 +5,10 @@ import os
 import re
 import stat
 import unicodedata
+from importlib import resources
 from pathlib import Path
 from typing import Any, Self
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -25,6 +27,8 @@ _ATTACHMENT_METHODS = {
     "animation": "sendAnimation",
 }
 _SEND_METHODS = frozenset({"sendMessage", *_ATTACHMENT_METHODS.values()})
+_CONNECTOR_ICON_MAX_BYTES = 10 * 1024
+_CONNECTOR_ICON_CAPTION = "Иконка для поля «Значок»: сохраните файл и загрузите его в ChatGPT."
 
 
 class TelegramFileError(ValueError):
@@ -73,6 +77,68 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _valid_button_text(value: object, max_units: int) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= max_units
+        and bool(value.strip())
+        and not any(unicodedata.category(character) == "Cs" for character in value)
+        and len(value.encode("utf-16-le")) // 2 <= max_units
+    )
+
+
+def _valid_button_url(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(
+            character.isspace() or unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in value
+        )
+    ):
+        return False
+    try:
+        url = urlsplit(value)
+        return (
+            url.scheme == "https"
+            and bool(url.hostname)
+            and url.username is None
+            and url.password is None
+            and (url.port is None or 1 <= url.port <= 65535)
+            and not url.query
+            and not url.fragment
+        )
+    except ValueError:
+        return False
+
+
+def _validate_reply_markup(reply_markup: object) -> None:
+    """Allow only bounded copy buttons and ordinary HTTPS link buttons."""
+    invalid = "Telegram reply markup is invalid."
+    if not isinstance(reply_markup, dict) or set(reply_markup) != {"inline_keyboard"}:
+        raise ValueError(invalid)
+    rows = reply_markup["inline_keyboard"]
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 4:
+        raise ValueError(invalid)
+    for row in rows:
+        if not isinstance(row, list) or not 1 <= len(row) <= 3:
+            raise ValueError(invalid)
+        for button in row:
+            if not isinstance(button, dict) or not _valid_button_text(button.get("text"), 64):
+                raise ValueError(invalid)
+            if set(button) == {"text", "copy_text"}:
+                copy_text = button["copy_text"]
+                if (
+                    not isinstance(copy_text, dict)
+                    or set(copy_text) != {"text"}
+                    or not _valid_button_text(copy_text["text"], 256)
+                ):
+                    raise ValueError(invalid)
+            elif set(button) != {"text", "url"} or not _valid_button_url(button["url"]):
+                raise ValueError(invalid)
+
+
 class TelegramClient:
     """Bot-only API calls. Injected HTTP clients remain owned by the caller."""
 
@@ -119,12 +185,18 @@ class TelegramClient:
             await self._client.aclose()
 
     async def _call(
-        self, method: str, payload: dict[str, Any], *, read_timeout: float = 10.0
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        read_timeout: float = 10.0,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
     ) -> Any:
+        content = {"json": payload} if files is None else {"data": payload, "files": files}
         try:
             response = await self._client.post(
                 f"{self._base_url}/{method}",
-                json=payload,
+                **content,
                 timeout=httpx.Timeout(10.0, read=read_timeout),
                 follow_redirects=False,
             )
@@ -211,6 +283,7 @@ class TelegramClient:
         text: str,
         *,
         entities: list[dict[str, Any]] | None = None,
+        reply_markup: dict[str, Any] | None = None,
         message_thread_id: int | None = None,
         reply_to_message_id: int | None = None,
     ) -> dict[str, Any]:
@@ -221,6 +294,9 @@ class TelegramClient:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if entities is not None:
             payload["entities"] = entities
+        if reply_markup is not None:
+            _validate_reply_markup(reply_markup)
+            payload["reply_markup"] = reply_markup
         if message_thread_id is not None:
             payload["message_thread_id"] = message_thread_id
         if reply_to_message_id is not None:
@@ -241,6 +317,40 @@ class TelegramClient:
         ):
             # A success envelope with an unusable acknowledgement does not
             # prove that Telegram rejected the message. Never retry it.
+            raise TelegramTransportError()
+        return result
+
+    async def send_connector_icon(self, chat_id: int) -> dict[str, Any]:
+        """Upload the packaged connector icon to one private chat in a single attempt."""
+        if not _is_int(chat_id) or not 1 <= chat_id <= 2**63 - 1:
+            raise ValueError("Telegram connector icon chat identifier is invalid.")
+        icon = None
+        try:
+            resource = resources.files("telegram_ping_mcp").joinpath("static", "telegram-icon.png")
+            with resource.open("rb") as stream:
+                icon = stream.read(_CONNECTOR_ICON_MAX_BYTES + 1)
+        except (OSError, ValueError):
+            # The resource's filesystem location must not enter the exception chain.
+            pass
+        if (
+            icon is None
+            or not icon.startswith(b"\x89PNG\r\n\x1a\n")
+            or len(icon) > _CONNECTOR_ICON_MAX_BYTES
+        ):
+            raise ValueError("Packaged Telegram connector icon is unavailable or invalid.")
+        result = await self._call(
+            "sendDocument",
+            {"chat_id": chat_id, "caption": _CONNECTOR_ICON_CAPTION},
+            files={"document": ("telegram-icon.png", icon, "image/png")},
+        )
+        if (
+            not isinstance(result, dict)
+            or not _is_int(result.get("message_id"))
+            or result["message_id"] < 1
+            or not isinstance(result.get("chat"), dict)
+            or not _is_int(result["chat"].get("id"))
+            or result["chat"]["id"] != chat_id
+        ):
             raise TelegramTransportError()
         return result
 
