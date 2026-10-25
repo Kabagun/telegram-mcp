@@ -214,7 +214,9 @@ async def test_csrf_origin_and_cookie_fail_before_code_consumption(client, setup
     assert "AI Connector" in page.text and "Код подключения из бота" in page.text
     assert "Подтвердите связь с вашим чатом" in page.text
     assert "127.0.0.1:1455" in page.text
-    assert "личным сообщениям и файлам" in page.text
+    assert "может читать сообщения и файлы, которые вы отправляете этому боту" in page.text
+    assert "не входит в Telegram-аккаунт" in page.text
+    assert "не видит остальные переписки, контакты и группы" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]

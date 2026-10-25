@@ -11,6 +11,7 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import quote, urlsplit
@@ -472,6 +473,19 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
     runtime.config.validate_for_serve("http", "127.0.0.1")
     mcp = mcp or create_mcp(runtime)
 
+    @mcp.custom_route("/assets/telegram-icon.png", methods=["GET"])
+    async def telegram_icon(request: Request) -> Response:
+        return Response(
+            files("telegram_ping_mcp").joinpath("static", "telegram-icon.png").read_bytes(),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": 'attachment; filename="telegram-icon.png"',
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+            },
+        )
+
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
         state = runtime.readiness()
@@ -513,7 +527,7 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
         )
 
     app = mcp.streamable_http_app()
-    public_paths: frozenset[str] = frozenset()
+    public_paths = frozenset({"/assets/telegram-icon.png"})
     metadata_url = ""
     if runtime.oauth is not None:
         routes = runtime.oauth.create_routes()
@@ -527,7 +541,7 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
                 resource_name="AI Connector",
             )
         )
-        public_paths = frozenset(route.path for route in routes)
+        public_paths = public_paths | frozenset(route.path for route in routes)
         app.router.routes.extend(routes)
         metadata_url = str(build_resource_metadata_url(resource_url))
     sdk_lifespan = app.router.lifespan_context

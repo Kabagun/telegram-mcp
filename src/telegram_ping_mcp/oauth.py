@@ -45,6 +45,8 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Route, request_response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .onboarding import PRIVACY_NOTICE
+
 OAUTH_SCOPE = "telegram"
 SCOPE = OAUTH_SCOPE
 ACCESS_TTL = 3600
@@ -810,8 +812,7 @@ class OAuthProvider(
                 "<h1>AI Connector</h1><h2>Подтвердите связь с вашим чатом</h2>"
                 f"<p>Клиент с адресом возврата: <strong>{domain}</strong></p>"
                 "<p>Отправьте /connect вашему Telegram-боту и скопируйте одноразовый код.</p>"
-                "<p>Разрешение даёт AI-клиенту доступ к вашим личным сообщениям и файлам "
-                "в боте и позволяет отправлять вам уведомления.</p>"
+                f"<p>{html.escape(PRIVACY_NOTICE)}</p>"
                 '<form method="post" action="/oauth/consent">'
                 f'<input type="hidden" name="request" value="{html.escape(nonce, quote=True)}">'
                 f'<input type="hidden" name="csrf" value="{csrf}">'

@@ -69,21 +69,33 @@ def bind(store: Store) -> None:
 
 def assert_guide(text: str, *, linked: bool = False) -> None:
     assert "AI Connector" in text
-    assert PUBLIC_URL in text
+    assert f"URL-адрес сервера: {PUBLIC_URL}\n" in text
     assert "https://claude.ai/" in text
     assert "https://chatgpt.com/" in text
-    assert "откройте плагины и добавьте AI Connector" in text
-    assert "настройки → Connectors → Add custom connector" in text
+    assert "Плагины → + → Добавить пользовательский сервер MCP" in text
+    assert "Название: AI Connector\n" in text
+    assert "Описание: Уведомления, ответы и файлы через Telegram-бота." in text
+    assert "Значок: скачайте PNG https://connector.example.test/assets/telegram-icon.png" in text
+    assert "и загрузите файл (256×256, до 10 КБ)" in text
+    assert "Подключение: выберите «URL-адрес сервера»" in text
+    assert "Аутентификация: OAuth" in text
+    assert "В расширенных настройках оставьте DCR и telegram" in text
+    assert "Остальные поля заполнятся автоматически; Client ID и Client Secret не нужны" in text
+    assert "OIDC не включайте" in text
+    assert "Отметьте «Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
+    assert "Установите плагин" in text
+    assert "в AI-чате выберите @AI Connector" in text
+    assert "Settings → Connectors → Add custom connector" in text
     assert "введите код из бота и разрешите доступ" in text
     assert ("личное приглашение" in text) is not linked
     assert ("нажмите Start" in text) is not linked
-    assert text.count("https://") == 3
+    assert ("Затем отправьте /connect, чтобы получить код входа" in text) is not linked
+    assert text.count("https://") == 4
     for removed in (
         "Streamable",
-        "HTTP",
-        "OAuth",
         "Bearer",
         "Authorization",
+        "PKCE",
         "API",
         "токен",
         "недоступно",
@@ -93,8 +105,41 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     ):
         assert removed not in text
     assert "/help" not in text
-    assert len(text) < 750
+    assert len(text) < 1800
     assert len(text.encode("utf-16-le")) // 2 <= 4096
+
+
+def test_guide_explains_bot_chat_access_and_user_consent_without_absolute_security_claims() -> None:
+    text = onboarding_text(PUBLIC_URL)
+    assert "Плагин работает только с вашим чатом с ботом" in text
+    assert "не входит в Telegram-аккаунт" in text
+    assert "не видит остальные переписки, контакты и группы" in text
+    assert "может читать сообщения и файлы, которые вы отправляете этому боту" in text
+    assert "и присылать вам ответы" in text
+    assert "Другие пользователи не видят ваши данные" in text
+    assert "Передача защищена HTTPS, доступ подтверждаете вы" in text
+    assert "Отключить — /unlink" in text
+    for claim in ("сквозное шифрование", "end-to-end", "полностью безопас", "не имеет доступа"):
+        assert claim not in text
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "icon_url"),
+    [
+        ("https://example.test/nested/path/mcp", "https://example.test/assets/telegram-icon.png"),
+        (
+            "https://example.test:8443/nested/mcp",
+            "https://example.test:8443/assets/telegram-icon.png",
+        ),
+        ("https://[::1]:8443/mcp", "https://[::1]:8443/assets/telegram-icon.png"),
+        ("https://пример.рф/mcp", "https://xn--e1afmkfd.xn--p1ai/assets/telegram-icon.png"),
+    ],
+)
+def test_icon_download_uses_public_endpoint_origin(endpoint, icon_url) -> None:
+    text = onboarding_text(endpoint, linked=True)
+    assert f"URL-адрес сервера: {endpoint}\n" in text
+    assert f"Значок: скачайте PNG {icon_url} и загрузите файл (256×256, до 10 КБ)." in text
+    assert text.count(endpoint) == 1
 
 
 def test_menus_offer_only_commands_for_the_binding_and_do_not_share_mutable_entries() -> None:
@@ -487,7 +532,9 @@ async def test_runtime_menu_failure_leaves_ready_and_chat_commands_can_recover(
 def test_missing_public_url_uses_owner_instructions() -> None:
     assert Config.from_env({}).public_mcp_url == ""
     text = onboarding_text()
-    assert "Адрес подключения запросите у владельца" in text
+    assert "URL-адрес сервера: адрес подключения запросите у владельца." in text
+    assert "Значок: PNG-иконку запросите у владельца." in text
+    assert "telegram-icon.png" not in text
     assert "https://connector.example.test" not in text
 
 
@@ -552,13 +599,18 @@ def test_public_mcp_url_rejects_unsafe_values_without_echoing_them(value) -> Non
         onboarding_text(value)
 
 
-@pytest.mark.parametrize("suffix", ["x" * 2027, "🙂" * 1013 + "x"])
-async def test_longest_public_url_and_connect_guide_fit_one_telegram_message(
-    tmp_path, suffix
-) -> None:
-    prefix = "https://example.test/"
-    url = prefix + suffix
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.test/" + "x" * 2027,
+        "https://example.test/" + "🙂" * 1013 + "x",
+        "https://" + ".".join(["x" * 63] * 3 + ["x" * 61]) + ":65535/" + "x" * 1780,
+        "https://a" + "\u034f" * 2030 + ".test/mcp",
+    ],
+)
+async def test_longest_public_url_and_connect_guide_fit_one_telegram_message(tmp_path, url) -> None:
     assert len(url.encode("utf-16-le")) // 2 == 2048
+    assert len(onboarding_text(url).encode("utf-16-le")) // 2 <= 4096
     bot = FakeBot()
     store = Store(tmp_path / "length.sqlite3")
     bind(store)

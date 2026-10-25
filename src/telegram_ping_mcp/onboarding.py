@@ -1,6 +1,17 @@
 """Short Telegram instructions for connecting an AI chat."""
 
+from urllib.parse import urlsplit
+
 from .config import normalize_public_mcp_url
+
+PRIVACY_NOTICE = (
+    "Плагин работает только с вашим чатом с ботом. Он не входит в Telegram-аккаунт "
+    "и не видит остальные переписки, контакты и группы. Подключённое AI-приложение "
+    "может читать сообщения и файлы, которые вы отправляете этому боту, "
+    "и присылать вам ответы. Другие пользователи не видят ваши данные. "
+    "Передача защищена HTTPS, доступ подтверждаете вы. "
+    "Отключить — /unlink."
+)
 
 
 def command_menu(*, linked: bool = False) -> list[dict[str, str]]:
@@ -37,13 +48,39 @@ def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
         ""
         if linked
         else "Сначала откройте личное приглашение в Telegram и нажмите Start. "
-        "Если приглашения нет, запросите его у владельца.\n\n"
+        "Если приглашения нет, запросите его у владельца. "
+        "Затем отправьте /connect, чтобы получить код входа.\n\n"
     )
-    address = f"Адрес: {endpoint}" if endpoint else "Адрес подключения запросите у владельца."
+    if endpoint:
+        parsed = urlsplit(endpoint)
+        # The endpoint stays exactly as configured. Canonicalize the icon's host
+        # so a long Unicode hostname cannot duplicate most of the message limit.
+        hostname = parsed.hostname or ""
+        hostname = f"[{hostname}]" if ":" in hostname else hostname.encode("idna").decode("ascii")
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        icon = (
+            f"скачайте PNG https://{hostname}{port}/assets/telegram-icon.png "
+            "и загрузите файл (256×256, до 10 КБ)."
+        )
+        address = endpoint
+    else:
+        icon = "PNG-иконку запросите у владельца."
+        address = "адрес подключения запросите у владельца."
     return (
-        invitation
-        + "1. В ChatGPT (https://chatgpt.com/) откройте плагины и добавьте AI Connector. "
-        "В Claude (https://claude.ai/) — настройки → Connectors → Add custom connector.\n"
-        f"2. Укажите адрес подключения. {address}\n"
-        "3. В открывшемся окне введите код из бота и разрешите доступ."
+        invitation + "ChatGPT: https://chatgpt.com/ → Плагины → + → "
+        "Добавить пользовательский сервер MCP.\n"
+        "Название: AI Connector\n"
+        "Описание: Уведомления, ответы и файлы через Telegram-бота.\n"
+        f"Значок: {icon}\n"
+        "Подключение: выберите «URL-адрес сервера».\n"
+        f"URL-адрес сервера: {address}\n"
+        "Аутентификация: OAuth\n"
+        "В расширенных настройках оставьте DCR и telegram. "
+        "Остальные поля заполнятся автоматически; Client ID и Client Secret не нужны. "
+        "OIDC не включайте.\n"
+        "Отметьте «Я понимаю и хочу продолжить» → «Создать в виде плагина». Установите плагин, "
+        "в AI-чате выберите @AI Connector. В окне подключения введите код из бота "
+        "и разрешите доступ.\n\n"
+        "Claude: https://claude.ai/ → Settings → Connectors → Add custom connector; "
+        "Name: AI Connector; Server URL: тот же адрес; Authentication: OAuth.\n\n" + PRIVACY_NOTICE
     )
