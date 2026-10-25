@@ -88,9 +88,9 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     assert "Загрузите её в «Значок» (256×256, до 10 КБ)" in text
     assert "Подключение: URL-адрес сервера" in text
     assert "Аутентификация: OAuth" in text
-    assert "DCR: автоматически\nScope: telegram" in text
-    assert "Client ID и Client Secret: не нужны" in text
-    assert "OIDC: выключен" in text
+    assert "3️⃣ Завершите подключение" in text
+    for removed in ("DCR", "Scope", "Client ID", "Client Secret", "OIDC"):
+        assert removed not in text
     assert "«Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
     assert "Установите плагин" in text
     assert "В AI-чате выберите @Telegram" in text
@@ -193,8 +193,7 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
     assert [entity_text(text, item) for item in entities if item["type"] == "bold"] == [
         "1️⃣ Откройте ChatGPT",
         "2️⃣ Заполните поля",
-        "3️⃣ Проверьте настройки",
-        "4️⃣ Завершите подключение",
+        "3️⃣ Завершите подключение",
         "Claude",
         "🔒 Доступ и приватность",
     ]
