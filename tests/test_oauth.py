@@ -211,7 +211,7 @@ async def test_csrf_origin_and_cookie_fail_before_code_consumption(client, setup
     provider = setup[0]
     registration = await register(client)
     fields, page = await begin(client, registration)
-    assert "AI Connector" in page.text and "Код подключения из бота" in page.text
+    assert "iConnector" in page.text and "Код подключения из бота" in page.text
     assert "Подтвердите связь с вашим чатом" in page.text
     assert "127.0.0.1:1455" in page.text
     assert "может читать сообщения и файлы, которые вы отправляете этому боту" in page.text

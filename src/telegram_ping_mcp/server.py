@@ -295,7 +295,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
     # omit the port altogether and need their own exact allowlist entry.
     hosts.extend(host[:-2] for host in runtime.config.allowed_hosts if host.endswith(":*"))
     mcp = FastMCP(
-        "Telegram Ping MCP",
+        "Telegram",
         instructions="Send as the Telegram bot to verified, opted-in users only. "
         "A sent status means Telegram accepted the message, not delivery or reading. "
         "Invitation URLs are secrets; pass them only to the intended recipient. "
@@ -538,7 +538,7 @@ def create_http_app(runtime: Runtime, mcp: FastMCP | None = None) -> Starlette:
                 resource_url,
                 [AnyHttpUrl(f"{issuer.scheme}://{issuer.netloc}")],
                 scopes_supported=["telegram"],
-                resource_name="AI Connector",
+                resource_name="Telegram",
             )
         )
         public_paths = public_paths | frozenset(route.path for route in routes)

@@ -128,7 +128,7 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_without_changin
         ]
         assert "synthetic-code-1" in copies
         assert PUBLIC_URL in copies
-        assert "AI Connector" in copies
+        assert "Telegram" in copies
     else:
         assert issued == []
         assert "Код входа:" not in guide["text"]

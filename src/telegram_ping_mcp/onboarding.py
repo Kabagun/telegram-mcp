@@ -14,7 +14,7 @@ PRIVACY_NOTICE = (
     "Отключить — /unlink."
 )
 
-_NAME = "AI Connector"
+_NAME = "Telegram"
 _DESCRIPTION = "Уведомления, ответы и файлы через Telegram-бота."
 _INVITATION_HEADING = "🔑 До подключения"
 _CHATGPT_HEADING = "1️⃣ Откройте ChatGPT"
@@ -137,7 +137,7 @@ def intro_text(*, linked: bool) -> str:
         else "Чтобы подключить AI-чат, используйте /connect."
     )
     return (
-        "AI Connector соединяет Telegram с вашим AI-чатом. Чат может присылать "
+        "iConnector соединяет Telegram с вашим AI-чатом. Чат может присылать "
         "уведомления и сообщения, читать ваши ответы и файлы.\n\n" + actions
     )
 
@@ -180,12 +180,12 @@ def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
         "OIDC: выключен\n\n"
         "4️⃣ Завершите подключение\n"
         "«Я понимаю и хочу продолжить» → «Создать в виде плагина».\n"
-        "Установите плагин. В AI-чате выберите @AI Connector.\n"
+        "Установите плагин. В AI-чате выберите @Telegram.\n"
         "В окне подключения введите код из бота и разрешите доступ.\n\n"
         "📎 Иконка PNG — файлом ниже.\n"
         "Загрузите её в «Значок» (256×256, до 10 КБ).\n\n"
         "Claude\n"
         "https://claude.ai/ → Settings → Connectors → Add custom connector.\n"
-        "Name: AI Connector; Server URL: адрес выше; Authentication: OAuth.\n\n"
+        "Name: Telegram; Server URL: адрес выше; Authentication: OAuth.\n\n"
         "🔒 Доступ и приватность\n" + privacy
     )

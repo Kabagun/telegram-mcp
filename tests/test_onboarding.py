@@ -78,12 +78,11 @@ def bind(store: Store) -> None:
 
 
 def assert_guide(text: str, *, linked: bool = False) -> None:
-    assert "AI Connector" in text
     assert f"URL-адрес сервера: {PUBLIC_URL}\n" in text
     assert "https://claude.ai/" in text
     assert "https://chatgpt.com/" in text
     assert "Плагины → +\nДобавить пользовательский сервер MCP" in text
-    assert "Название: AI Connector\n" in text
+    assert "Название: Telegram\n" in text
     assert "Описание: Уведомления, ответы и файлы через Telegram-бота." in text
     assert "📎 Иконка PNG — файлом ниже." in text
     assert "Загрузите её в «Значок» (256×256, до 10 КБ)" in text
@@ -94,8 +93,9 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     assert "OIDC: выключен" in text
     assert "«Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
     assert "Установите плагин" in text
-    assert "В AI-чате выберите @AI Connector" in text
+    assert "В AI-чате выберите @Telegram" in text
     assert "Settings → Connectors → Add custom connector" in text
+    assert "Name: Telegram; Server URL: адрес выше; Authentication: OAuth." in text
     assert "введите код из бота и разрешите доступ" in text
     assert ("личное приглашение" in text) is not linked
     assert ("нажмите Start" in text) is not linked
@@ -181,7 +181,7 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
     entities, keyboard = onboarding_presentation(text)
     assert keyboard is not None
     expected = {
-        "📋 Название": "AI Connector",
+        "📋 Название": "Telegram",
         "📋 Описание": "Уведомления, ответы и файлы через Telegram-бота.",
         "📋 Адрес": endpoint,
         "📋 Код": code,
@@ -239,7 +239,7 @@ def test_presentation_does_not_format_unknown_lines_or_unlinked_login_codes() ->
     [
         "Сначала отправьте /start, чтобы включить подключение.\n📎 Иконка PNG — файлом ниже.",
         "Уведомления отключены.",
-        "Название: AI Connector\nКод входа: synthetic-code",
+        "Название: Telegram\nКод входа: synthetic-code",
     ],
 )
 def test_presentation_keeps_short_statuses_plain(status) -> None:
@@ -283,7 +283,7 @@ def test_menus_offer_only_commands_for_the_binding_and_do_not_share_mutable_entr
 
 
 def assert_intro(text: str, *, linked: bool) -> None:
-    assert "AI Connector" in text
+    assert "iConnector соединяет Telegram с вашим AI-чатом." in text
     assert "уведомления и сообщения" in text
     assert "читать ваши ответы и файлы" in text
     assert "Модель" not in text
@@ -297,7 +297,7 @@ def assert_intro(text: str, *, linked: bool) -> None:
 async def test_start_is_short_and_keeps_only_relevant_binding_status(setup) -> None:
     service, store, bot = setup
     await service.handle_update(command("/start"))
-    assert bot.sends[-1]["text"].startswith("AI Connector")
+    assert bot.sends[-1]["text"].startswith("iConnector")
     assert "администратор" not in bot.sends[-1]["text"]
     assert "ссылку-приглашение" not in bot.sends[-1]["text"]
     assert service.find_users() == []
@@ -580,7 +580,7 @@ async def test_optout_commands_remain_concise(setup, text) -> None:
     bind(store)
     await service.handle_update(command(text))
     assert len(bot.sends) == 1
-    assert "AI Connector" not in bot.sends[0]["text"]
+    assert "iConnector" not in bot.sends[0]["text"]
     assert len(bot.sends[0]["text"]) < 150
     assert service.get_user("synthetic") is None or not service.get_user("synthetic")["active"]
     assert bot.command_menus[-1]["commands"] == command_menu(linked=text != "/unlink")

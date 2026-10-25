@@ -808,8 +808,8 @@ class OAuthProvider(
             response = HTMLResponse(
                 '<!doctype html><html lang="ru"><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                "<title>AI Connector</title>" + _CONSENT_STYLE + "<body><main>"
-                "<h1>AI Connector</h1><h2>Подтвердите связь с вашим чатом</h2>"
+                "<title>iConnector</title>" + _CONSENT_STYLE + "<body><main>"
+                "<h1>iConnector</h1><h2>Подтвердите связь с вашим чатом</h2>"
                 f"<p>Клиент с адресом возврата: <strong>{domain}</strong></p>"
                 "<p>Отправьте /connect вашему Telegram-боту и скопируйте одноразовый код.</p>"
                 f"<p>{html.escape(PRIVACY_NOTICE)}</p>"
@@ -901,9 +901,9 @@ class OAuthProvider(
         return HTMLResponse(
             '<!doctype html><html lang="ru"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            "<title>AI Connector</title>"
+            "<title>iConnector</title>"
             + _CONSENT_STYLE
-            + f"<body><main><h1>AI Connector</h1><p>{html.escape(message)}</p>"
+            + f"<body><main><h1>iConnector</h1><p>{html.escape(message)}</p>"
             "</main></body></html>",
             status,
             headers=_SECURITY_HEADERS,

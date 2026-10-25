@@ -123,7 +123,7 @@ async def test_real_sdk_http_end_to_end_auth_link_send_dedup_optout_group(config
                 ) as streams:
                     async with ClientSession(streams[0], streams[1]) as session:
                         initialized = await session.initialize()
-                        assert initialized.serverInfo.name == "Telegram Ping MCP"
+                        assert initialized.serverInfo.name == "Telegram"
                         tools = await session.list_tools()
                         assert {tool.name for tool in tools.tools} == {
                             "create_user_link",
@@ -297,7 +297,7 @@ async def test_real_stdio_subprocess_sdk_protocol_without_real_telegram(tmp_path
     parameters = StdioServerParameters(command=sys.executable, args=[str(script)])
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
-            assert (await session.initialize()).serverInfo.name == "Telegram Ping MCP"
+            assert (await session.initialize()).serverInfo.name == "Telegram"
             assert len((await session.list_tools()).tools) == 12
             assert structured(await session.call_tool("find_users", {})) == []
 
