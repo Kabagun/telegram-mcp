@@ -437,7 +437,26 @@ class Service:
         if token is not None and name != "start":
             return
         if name == "connect":
-            response = self._connect_text(telegram_id)
+            if self._login_code_issuer is not None:
+                try:
+                    author_username = author.get("username")
+                    if author_username is not None:
+                        author_username = _safe_text(author_username, maximum=128, allow_blank=True)
+                    first_name = _safe_text(
+                        author.get("first_name", ""), maximum=128, allow_blank=True
+                    )
+                except ServiceError:
+                    return
+                try:
+                    self._store.ensure_private_user(
+                        telegram_id, telegram_id, author_username, first_name
+                    )
+                except Exception:
+                    response = f"{self._onboarding_text}\n\n{_CONNECT_RETRY}"
+                else:
+                    response = self._connect_text(telegram_id)
+            else:
+                response = self._connect_text(telegram_id)
             if _CONNECT_ICON_NOTE not in response:
                 response = f"{response}\n\n{_CONNECT_ICON_NOTE}"
             response = _message_text(response)

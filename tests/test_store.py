@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -106,6 +108,147 @@ def test_stop_and_relink_resubscribe_only_the_same_verified_identity(store: Stor
     assert link(store)["active"] is True
     assert store.set_active_by_telegram(123, True)
     assert store.get_user("example")["active"] is True
+
+
+def test_private_enrollment_creates_an_active_user_with_an_opaque_key(store: Store) -> None:
+    user = store.ensure_private_user(123, 123, "example", " Example ")
+    assert re.fullmatch(r"tg_[A-Za-z0-9_-]{32}", user["user_key"])
+    assert user == {
+        "user_key": user["user_key"],
+        "display_name": "Example",
+        "telegram_user_id": 123,
+        "chat_id": 123,
+        "username": "example",
+        "first_name": " Example ",
+        "active": True,
+    }
+    assert store.get_user_by_telegram(123) == user
+    assert store.get_user(user["user_key"]) == user
+
+
+@pytest.mark.parametrize(
+    "first_name,username,display_name",
+    [
+        ("First", "handle", "First"),
+        (" \t", " handle ", "handle"),
+        ("", None, "Telegram user"),
+        (" \t", " \n", "Telegram user"),
+    ],
+)
+def test_private_enrollment_always_has_a_nonblank_display_name(
+    store: Store, first_name: str, username: str | None, display_name: str
+) -> None:
+    user = store.ensure_private_user(123, 123, username, first_name)
+    assert user["display_name"] == display_name
+    assert user["username"] == username
+    assert user["first_name"] == first_name
+
+
+@pytest.mark.parametrize("operator_linked", [False, True])
+@pytest.mark.parametrize("active", [False, True])
+def test_private_enrollment_preserves_existing_binding_metadata_and_active_state(
+    store: Store,
+    database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operator_linked: bool,
+    active: bool,
+) -> None:
+    if operator_linked:
+        original = link(store, "operator-key", 123)
+    else:
+        original = store.ensure_private_user(123, 123, "original", "Original")
+    store.set_active_by_telegram(123, active)
+    original["active"] = active
+
+    def unexpected_key_generation(_: int) -> str:
+        pytest.fail("Existing private users must not receive another key.")
+
+    monkeypatch.setattr("telegram_ping_mcp.store.secrets.token_urlsafe", unexpected_key_generation)
+    assert store.ensure_private_user(123, 123, "replacement", "Replacement") == original
+    assert Store(database).get_user(original["user_key"]) == original
+    assert store.list_users() == [original]
+
+
+def test_private_enrollment_is_atomic_between_independent_store_instances(database: Path) -> None:
+    stores = [Store(database), Store(database)]
+    ready = Barrier(8)
+
+    def enroll(index: int) -> dict:
+        ready.wait(timeout=10)
+        return stores[index % 2].ensure_private_user(123, 123, f"handle{index}", f"Name {index}")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        users = list(pool.map(enroll, range(8)))
+    assert all(user == users[0] for user in users)
+    assert Store(database).list_users() == [users[0]]
+
+
+def test_private_enrollment_retries_collisions_and_keeps_invitations_usable(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    existing = link(store, "tg_taken", 456)
+    invitation = store.create_link("tg_pending", "Pending operator user")
+    conflicting = store.create_link("another-key", "Another")
+    candidates = iter(["taken", "pending", "opaque-key"])
+    sizes = []
+
+    def generate_key(size: int) -> str:
+        sizes.append(size)
+        return next(candidates)
+
+    monkeypatch.setattr("telegram_ping_mcp.store.secrets.token_urlsafe", generate_key)
+    user = store.ensure_private_user(123, 123, "handle", "Name")
+    assert user["user_key"] == "tg_opaque-key"
+    assert sizes == [24, 24, 24]
+    assert store.get_user("tg_taken") == existing
+    assert store.consume_link(invitation["token"], 789, 789, None, "Other")["user_key"] == (
+        "tg_pending"
+    )
+    with pytest.raises(ValueError, match="already linked"):
+        store.consume_link(conflicting["token"], 123, 123, None, "X")
+    assert store.get_user_by_telegram(123) == user
+
+
+@pytest.mark.parametrize(
+    "telegram_id,chat_id",
+    [
+        (123, -123),
+        (-123, -123),
+        (123, 124),
+        (0, 0),
+        (True, True),
+        (123, True),
+        (123.0, 123),
+        (123, 123.0),
+        ("123", 123),
+        (123, "123"),
+        (None, 123),
+        (123, None),
+        (2**63, 2**63),
+        (123, 2**63),
+    ],
+)
+def test_private_enrollment_requires_a_valid_exact_private_identity(
+    store: Store, telegram_id: int, chat_id: int
+) -> None:
+    with pytest.raises(ValueError) as error:
+        store.ensure_private_user(telegram_id, chat_id, None, "Example")
+    assert "123" not in str(error.value)
+    assert store.list_users() == []
+
+
+@pytest.mark.parametrize("username,first_name", [(123, "Name"), (False, "Name"), (None, None)])
+def test_private_enrollment_validates_author_string_types(
+    store: Store, username: str | None, first_name: str
+) -> None:
+    with pytest.raises(ValueError):
+        store.ensure_private_user(123, 123, username, first_name)
+    assert store.list_users() == []
+
+
+def test_private_enrollment_accepts_the_largest_supported_identity(store: Store) -> None:
+    user = store.ensure_private_user(2**63 - 1, 2**63 - 1, None, "Example")
+    assert user["telegram_user_id"] == user["chat_id"] == 2**63 - 1
 
 
 def test_search_is_literal_case_insensitive_and_covers_all_public_name_fields(store: Store) -> None:

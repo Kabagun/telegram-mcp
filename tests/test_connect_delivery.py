@@ -95,7 +95,7 @@ def setup_service(
 
 @pytest.mark.parametrize("active", [None, False, True])
 @pytest.mark.parametrize("text", ["/connect", "/connect@SYNTHETIC_BOT"])
-async def test_connect_sends_formatted_guide_then_icon_then_menu_without_changing_optin(
+async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_existing_optin(
     tmp_path, active, text
 ) -> None:
     service, store, bot, issued = setup_service(tmp_path, active=active)
@@ -114,11 +114,22 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_without_changin
         assert "reply_markup" not in guide
     else:
         assert guide["reply_markup"] == markup
-    assert bot.events[-1]["commands"] == command_menu(linked=active is not None)
-    assert store.list_users() == before
-    if active is True:
-        assert issued == ["synthetic"]
+    assert bot.events[-1]["commands"] == command_menu(linked=True)
+    if active is None:
+        users = store.list_users()
+        assert len(users) == 1
+        user = users[0]
+        assert user["user_key"].startswith("tg_")
+        assert user["telegram_user_id"] == user["chat_id"] == 7001
+        assert user["first_name"] == "Synthetic"
+        assert user["active"] is True
+    else:
+        assert store.list_users() == before
+        user = before[0]
+    if active is not False:
+        assert issued == [user["user_key"]]
         assert "Код входа: synthetic-code-1\n" in guide["text"]
+        assert "приглашение" not in guide["text"]
         assert any(entity["type"] == "bold" for entity in entities)
         copies = [
             button["copy_text"]["text"]
@@ -221,7 +232,7 @@ async def test_failed_fallback_does_not_retry_or_deactivate_user(tmp_path, failu
     ],
 )
 async def test_untrusted_or_noncommand_connect_updates_send_nothing(tmp_path, mutation) -> None:
-    service, store, bot, issued = setup_service(tmp_path)
+    service, store, bot, issued = setup_service(tmp_path, active=None)
     before = store.list_users()
     update = command()
     update["message"].update(copy.deepcopy(mutation))

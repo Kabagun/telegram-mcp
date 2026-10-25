@@ -133,6 +133,49 @@ class Store:
             )
         return {"token": token, "expires_at": expires_at, "user_key": user_key}
 
+    def ensure_private_user(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        username: str | None,
+        first_name: str,
+    ) -> dict[str, Any]:
+        """Enroll a private identity once, preserving any existing binding and state."""
+        self._integer(telegram_user_id, "Private chat identity", minimum=1)
+        self._integer(chat_id, "Private chat identity", minimum=1)
+        if telegram_user_id != chat_id:
+            raise ValueError("A private chat is required.")
+        if username is not None and not isinstance(username, str):
+            raise ValueError("Username is invalid.")
+        if not isinstance(first_name, str):
+            raise ValueError("First name is invalid.")
+        with self._transaction() as connection:
+            row = connection.execute(
+                f"SELECT {_USER_COLUMNS} FROM users WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+            if row is not None:
+                return self._user(row)
+            while True:
+                user_key = "tg_" + secrets.token_urlsafe(24)
+                if not connection.execute(
+                    """SELECT 1 FROM users WHERE user_key = ?
+                       UNION ALL SELECT 1 FROM link_tokens WHERE user_key = ? LIMIT 1""",
+                    (user_key, user_key),
+                ).fetchone():
+                    break
+            display_name = first_name.strip() or (username or "").strip() or "Telegram user"
+            connection.execute(
+                """INSERT INTO users
+                   (user_key, display_name, telegram_user_id, chat_id, username, first_name, active)
+                   VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                (user_key, display_name, telegram_user_id, chat_id, username, first_name),
+            )
+            row = connection.execute(
+                f"SELECT {_USER_COLUMNS} FROM users WHERE user_key = ?", (user_key,)
+            ).fetchone()
+            return self._user(row)
+
     def consume_link(
         self,
         token: str,

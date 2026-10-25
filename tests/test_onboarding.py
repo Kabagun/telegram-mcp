@@ -97,9 +97,9 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
     assert "Settings → Connectors → Add custom connector" in text
     assert "Name: Telegram; Server URL: адрес выше; Authentication: OAuth." in text
     assert "введите код из бота и разрешите доступ" in text
-    assert ("личное приглашение" in text) is not linked
-    assert ("нажмите Start" in text) is not linked
-    assert ("Затем отправьте /connect, чтобы получить код входа" in text) is not linked
+    assert "приглашение" not in text
+    assert "нажмите Start" not in text
+    assert "Затем отправьте /connect, чтобы получить код входа" not in text
     assert text.count("https://") == 3
     for removed in (
         "Streamable",
@@ -217,7 +217,7 @@ def test_presentation_without_a_login_code_has_no_code_button(linked) -> None:
     assert "📋 Код" not in copy_buttons(keyboard)
 
 
-def test_presentation_does_not_format_unknown_lines_or_unlinked_login_codes() -> None:
+def test_presentation_formats_issued_codes_and_ignores_unknown_guide_lines() -> None:
     extra = (
         "\n\nПользовательский заголовок 🙂\nНазвание: Другое имя\nОписание: Другой текст\n"
         "URL-адрес сервера: http://unsafe.example.test/mcp\nКод входа: synthetic-unlinked"
@@ -225,9 +225,11 @@ def test_presentation_does_not_format_unknown_lines_or_unlinked_login_codes() ->
     text = onboarding_text(PUBLIC_URL) + extra
     entities, keyboard = onboarding_presentation(text)
     assert keyboard is not None
-    assert "📋 Код" not in copy_buttons(keyboard)
+    assert copy_buttons(keyboard)["📋 Код"] == "synthetic-unlinked"
+    extra_offset = len(text[: -len(extra)].encode("utf-16-le")) // 2
     assert all(
-        item["offset"] + item["length"] <= len(text[: -len(extra)].encode("utf-16-le")) // 2
+        item["offset"] + item["length"] <= extra_offset
+        or entity_text(text, item) == "synthetic-unlinked"
         for item in entities
     )
     assert copy_buttons(keyboard)["📋 Адрес"] == PUBLIC_URL
@@ -389,14 +391,12 @@ async def test_connect_issues_fresh_codes_only_in_replies_and_keeps_binding(tmp_
     assert service.get_user("synthetic")["active"] is True
 
 
-@pytest.mark.parametrize("active", [None, False])
-async def test_connect_does_not_issue_codes_without_active_binding_or_consume_invite(
-    tmp_path, active
+async def test_connect_does_not_issue_codes_for_inactive_binding_or_consume_invite(
+    tmp_path,
 ) -> None:
     store = Store(tmp_path / "inactive-code.sqlite3")
-    if active is False:
-        bind(store)
-        store.set_active_by_telegram(7001, False)
+    bind(store)
+    store.set_active_by_telegram(7001, False)
     bot = FakeBot()
 
     def issue(user_key):
@@ -411,6 +411,115 @@ async def test_connect_does_not_issue_codes_without_active_binding_or_consume_in
     assert "Код входа:" not in bot.sends[-1]["text"]
     await service.handle_update(command(f"/start {token}"))
     assert service.get_user("synthetic")["active"] is True
+
+
+@pytest.mark.parametrize("active", [False, True])
+async def test_connect_preserves_existing_identity_and_profile_metadata(tmp_path, active) -> None:
+    store = Store(tmp_path / "preserved-identity.sqlite3")
+    invite = store.create_link("operator-owned-key", "Operator supplied display name")
+    store.consume_link(invite["token"], 7001, 7001, "stored_username", "Stored name")
+    store.set_active_by_telegram(7001, active)
+    before = store.get_user("operator-owned-key")
+    issued = []
+
+    def issue(user_key):
+        issued.append(user_key)
+        return "synthetic-preserved-code"
+
+    bot = FakeBot()
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
+    update = command("/connect")
+    update["message"]["from"].update(username="current_username", first_name="Current name")
+
+    await service.handle_update(update)
+
+    assert store.list_users() == [before]
+    assert issued == (["operator-owned-key"] if active else [])
+    if active:
+        assert "Код входа: synthetic-preserved-code" in bot.sends[-1]["text"]
+    else:
+        assert "Сначала отправьте /start" in bot.sends[-1]["text"]
+        assert "Код входа:" not in bot.sends[-1]["text"]
+
+
+async def test_connect_enrollment_failure_is_safe_and_can_be_retried(tmp_path, monkeypatch, caplog):
+    store = Store(tmp_path / "enrollment-retry.sqlite3")
+    bot = FakeBot()
+    issued = []
+
+    def issue(user_key):
+        issued.append(user_key)
+        return "synthetic-retry-code"
+
+    ensure = store.ensure_private_user
+
+    def fail(*args):
+        raise RuntimeError("synthetic-private-enrollment-error")
+
+    monkeypatch.setattr(store, "ensure_private_user", fail)
+    service = Service(
+        store, bot, "synthetic_bot", public_mcp_url=PUBLIC_URL, login_code_issuer=issue
+    )
+
+    await service.handle_update(command("/connect"))
+
+    assert store.list_users() == []
+    assert issued == []
+    assert_guide(bot.sends[-1]["text"])
+    assert "Не удалось получить код входа. Повторите /connect." in bot.sends[-1]["text"]
+    assert "Код входа:" not in bot.sends[-1]["text"]
+    assert "synthetic-private-enrollment-error" not in str(bot.sends)
+    assert "synthetic-private-enrollment-error" not in caplog.text
+    assert bot.command_menus[-1]["commands"] == command_menu()
+    monkeypatch.setattr(store, "ensure_private_user", ensure)
+
+    await service.handle_update(command("/connect"))
+
+    user = store.get_user_by_telegram(7001)
+    assert user is not None and user["active"] is True
+    assert issued == [user["user_key"]]
+    assert "Код входа: synthetic-retry-code" in bot.sends[-1]["text"]
+    assert bot.command_menus[-1]["commands"] == command_menu(linked=True)
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"username": 123},
+        {"username": {}},
+        {"username": "x" * 129},
+        {"username": "synthetic\nusername"},
+        {"username": "\ud800"},
+        {"first_name": None},
+        {"first_name": False},
+        {"first_name": "x" * 129},
+        {"first_name": "synthetic\x00name"},
+        {"first_name": "\ud800"},
+    ],
+)
+async def test_invalid_connect_author_metadata_cannot_enroll_or_issue_codes(
+    tmp_path, bound, metadata
+) -> None:
+    store = Store(tmp_path / "invalid-author.sqlite3")
+    if bound:
+        bind(store)
+    before = store.list_users()
+    bot = FakeBot()
+
+    def issue(user_key):
+        pytest.fail("Malformed author metadata must not issue a login code")
+
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
+    update = command("/connect")
+    update["message"]["from"].update(metadata)
+
+    await service.handle_update(update)
+
+    assert store.list_users() == before
+    assert bot.sends == []
+    assert bot.documents == []
+    assert bot.command_menus == []
 
 
 async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(

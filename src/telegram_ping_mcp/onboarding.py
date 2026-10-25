@@ -16,10 +16,8 @@ PRIVACY_NOTICE = (
 
 _NAME = "Telegram"
 _DESCRIPTION = "Уведомления, ответы и файлы через Telegram-бота."
-_INVITATION_HEADING = "🔑 До подключения"
 _CHATGPT_HEADING = "1️⃣ Откройте ChatGPT"
 _SECTION_HEADINGS = {
-    _INVITATION_HEADING,
     _CHATGPT_HEADING,
     "2️⃣ Заполните поля",
     "3️⃣ Завершите подключение",
@@ -55,7 +53,6 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
     entities = []
     values = {}
     endpoint = ""
-    linked = _INVITATION_HEADING not in lines
     offset = 0
     for content in lines:
         if content in _SECTION_HEADINGS:
@@ -78,7 +75,7 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
             else:
                 if endpoint:
                     field = prefix
-        if linked and content.startswith("Код входа: "):
+        if content.startswith("Код входа: "):
             prefix = "Код входа: "
             value = content[len(prefix) :]
             if (
@@ -144,14 +141,6 @@ def intro_text(*, linked: bool) -> str:
 def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
     """Return one plain-text Telegram message, also safe with a maximum-length URL."""
     endpoint = normalize_public_mcp_url(public_mcp_url)
-    invitation = (
-        ""
-        if linked
-        else _INVITATION_HEADING + "\n"
-        "Откройте личное приглашение в Telegram и нажмите Start.\n"
-        "Если приглашения нет, запросите его у владельца.\n"
-        "Затем отправьте /connect, чтобы получить код входа.\n\n"
-    )
     address = endpoint or "адрес подключения запросите у владельца."
     privacy = (
         "• Плагин работает только с вашим чатом с ботом. Он не входит в Telegram-аккаунт "
@@ -163,7 +152,7 @@ def onboarding_text(public_mcp_url: str = "", *, linked: bool = False) -> str:
         "• Отключить — /unlink."
     )
     return (
-        invitation + _CHATGPT_HEADING + "\n"
+        _CHATGPT_HEADING + "\n"
         "https://chatgpt.com/ → Плагины → +\n"
         "Добавить пользовательский сервер MCP\n\n"
         "2️⃣ Заполните поля\n"
