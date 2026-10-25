@@ -7,6 +7,7 @@ import math
 import secrets
 import sqlite3
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -246,6 +247,32 @@ class Store:
                 f"SELECT {_USER_COLUMNS} FROM users WHERE user_key = ?", (user_key,)
             ).fetchone()
             return self._user(row) if row is not None else None
+
+    def set_display_name(
+        self, user_key: str, telegram_user_id: int, display_name: str
+    ) -> dict[str, Any]:
+        """Name only the active identity already verified by the consent code."""
+        self._text(user_key, "User key")
+        self._integer(telegram_user_id, "Telegram identity", minimum=1)
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name) > 128
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in display_name)
+        ):
+            raise ValueError("Account name is invalid.")
+        with self._transaction() as connection:
+            changed = connection.execute(
+                "UPDATE users SET display_name = ? "
+                "WHERE user_key = ? AND telegram_user_id = ? AND active = 1",
+                (display_name.strip(), user_key, telegram_user_id),
+            )
+            if not changed.rowcount:
+                raise ValueError("An active verified Telegram user is required.")
+            row = connection.execute(
+                f"SELECT {_USER_COLUMNS} FROM users WHERE user_key = ?", (user_key,)
+            ).fetchone()
+            return self._user(row)
 
     def get_user_by_telegram(self, telegram_user_id: int) -> dict[str, Any] | None:
         self._integer(telegram_user_id, "Telegram identity", minimum=1)

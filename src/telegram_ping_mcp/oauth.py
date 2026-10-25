@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -308,6 +309,7 @@ class OAuthProvider(
         issuer_url: str,
         resource_url: str,
         get_user: Callable[[str], dict | None],
+        set_account_name: Callable[[str, int, str], dict] | None = None,
     ) -> None:
         issuer = urlsplit(issuer_url)
         resource = urlsplit(resource_url)
@@ -327,6 +329,7 @@ class OAuthProvider(
         self.issuer_url = str(AnyHttpUrl(issuer_url)).rstrip("/")
         self.resource_url = resource_url
         self.get_user = get_user
+        self.set_account_name = set_account_name
         with self._db() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
@@ -809,35 +812,7 @@ class OAuthProvider(
                     (_hash(csrf), _hash(nonce)),
                 )
             params = AuthorizationParams.model_validate_json(row["params"])
-            callback = urlsplit(str(params.redirect_uri))
-            domain = html.escape(callback.netloc)
-            headers = dict(_SECURITY_HEADERS)
-            # Native same-origin form submissions must retain Origin for the strict check below.
-            headers["Referrer-Policy"] = "same-origin"
-            # Some browsers apply form-action to the redirect following a form POST.
-            # Permit only the validated callback origin in addition to our own form.
-            headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
-                "form-action 'self';", f"form-action 'self' {callback.scheme}://{callback.netloc};"
-            )
-            response = HTMLResponse(
-                '<!doctype html><html lang="ru"><meta charset="utf-8">'
-                '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                "<title>AI Connector</title>" + _CONSENT_STYLE + "<body><main>"
-                "<h1>AI Connector</h1><h2>Подтвердите связь с вашим чатом</h2>"
-                f"<p>Клиент с адресом возврата: <strong>{domain}</strong></p>"
-                "<p>Отправьте /connect вашему Telegram-боту и скопируйте одноразовый код.</p>"
-                f"<p>{html.escape(PRIVACY_NOTICE)}</p>"
-                '<form method="post" action="/oauth/consent">'
-                f'<input type="hidden" name="request" value="{html.escape(nonce, quote=True)}">'
-                f'<input type="hidden" name="csrf" value="{csrf}">'
-                '<label>Код подключения из бота <input name="code" required maxlength="80" '
-                'autocomplete="off" spellcheck="false"></label>'
-                '<button name="decision" value="allow" type="submit">Разрешить подключение</button>'
-                '<button class="secondary" name="decision" value="deny" type="submit" '
-                "formnovalidate>Отказать</button>"
-                "</form></main></body></html>",
-                headers=headers,
-            )
+            response = self._consent_form(params, nonce, csrf)
             response.set_cookie(
                 _COOKIE,
                 csrf,
@@ -882,13 +857,37 @@ class OAuthProvider(
             login_row = db.execute(
                 "SELECT * FROM login_codes WHERE code_hash = ?", (_hash(login),)
             ).fetchone()
-            if (
-                login_row is None
-                or self._user(login_row["user_key"], login_row["telegram_user_id"]) is None
-            ):
+            user = (
+                self._user(login_row["user_key"], login_row["telegram_user_id"])
+                if login_row is not None
+                else None
+            )
+            if user is None:
                 return self._page_error("Код недействителен. Получите новый код командой /connect.")
             if db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] >= MAX_PENDING:
                 return self._page_error("Слишком много подключений. Попробуйте позже.", 429)
+            username = user.get("username")
+            if self.set_account_name is not None and not (
+                isinstance(username, str) and username.strip()
+            ):
+                supplied_name = form.get("account_name", "")
+                account_name = supplied_name.strip() if isinstance(supplied_name, str) else ""
+                if (
+                    not account_name
+                    or len(account_name) > 128
+                    or any(unicodedata.category(char) in {"Cc", "Cs"} for char in supplied_name)
+                ):
+                    return self._consent_form(
+                        params, nonce, csrf, login=login, invalid_name="account_name" in form
+                    )
+                try:
+                    self.set_account_name(
+                        login_row["user_key"], login_row["telegram_user_id"], account_name
+                    )
+                except Exception:
+                    return self._page_error("Не удалось сохранить имя аккаунта. Попробуйте позже.")
+                if self._user(login_row["user_key"], login_row["telegram_user_id"]) is None:
+                    return self._page_error("Не удалось сохранить имя аккаунта. Попробуйте позже.")
             code = _opaque()
             data = {
                 "client_id": row["client_id"],
@@ -909,6 +908,59 @@ class OAuthProvider(
             db.execute("DELETE FROM login_codes WHERE user_key = ?", (login_row["user_key"],))
             db.execute("DELETE FROM pending WHERE nonce_hash = ?", (_hash(nonce),))
             return self._finish(params, code=code)
+
+    @staticmethod
+    def _consent_form(
+        params: AuthorizationParams,
+        nonce: str,
+        csrf: str,
+        *,
+        login: str | None = None,
+        invalid_name: bool = False,
+    ) -> HTMLResponse:
+        callback = urlsplit(str(params.redirect_uri))
+        headers = dict(_SECURITY_HEADERS)
+        # Native same-origin form submissions must retain Origin for the strict POST check.
+        headers["Referrer-Policy"] = "same-origin"
+        # Some browsers apply form-action to the redirect following a form POST.
+        # Permit only the validated callback origin in addition to our own form.
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "form-action 'self';", f"form-action 'self' {callback.scheme}://{callback.netloc};"
+        )
+        if login is None:
+            heading = "Подтвердите связь с вашим чатом"
+            prompt = "Отправьте /connect вашему Telegram-боту и скопируйте одноразовый код."
+            fields = (
+                '<label>Код подключения из бота <input name="code" required maxlength="80" '
+                'autocomplete="off" spellcheck="false"></label>'
+            )
+        else:
+            heading = "Как назвать аккаунт?"
+            prompt = "У вашего Telegram-аккаунта нет @никнейма. Укажите имя для подключения."
+            fields = (
+                f'<input type="hidden" name="code" value="{html.escape(login, quote=True)}">'
+                '<label>Имя аккаунта <input name="account_name" required maxlength="128" '
+                'autocomplete="off"></label>'
+            )
+            if invalid_name:
+                prompt += " Введите имя от 1 до 128 символов без управляющих символов."
+        return HTMLResponse(
+            '<!doctype html><html lang="ru"><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>AI Connector</title>" + _CONSENT_STYLE + "<body><main>"
+            f"<h1>AI Connector</h1><h2>{heading}</h2>"
+            f"<p>Клиент с адресом возврата: <strong>{html.escape(callback.netloc)}</strong></p>"
+            f"<p>{prompt}</p><p>{html.escape(PRIVACY_NOTICE)}</p>"
+            '<form method="post" action="/oauth/consent">'
+            f'<input type="hidden" name="request" value="{html.escape(nonce, quote=True)}">'
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf, quote=True)}">'
+            + fields
+            + '<button name="decision" value="allow" type="submit">Разрешить подключение</button>'
+            '<button class="secondary" name="decision" value="deny" type="submit" '
+            "formnovalidate>Отказать</button>"
+            "</form></main></body></html>",
+            headers=headers,
+        )
 
     @staticmethod
     def _page_error(message: str, status: int = 400) -> Response:

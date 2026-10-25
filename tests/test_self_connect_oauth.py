@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import re
 import sqlite3
 from urllib.parse import parse_qs, urlsplit
@@ -112,6 +113,19 @@ async def test_first_connect_code_completes_oauth_and_stays_scoped_after_reenrol
                 data={"request": nonce, "csrf": csrf, "code": login, "decision": "allow"},
                 headers={"Origin": BASE},
             )
+            assert approval.status_code == 200
+            assert "Как назвать аккаунт?" in approval.text
+            approval = await http.post(
+                "/oauth/consent",
+                data={
+                    "request": nonce,
+                    "csrf": csrf,
+                    "code": login,
+                    "decision": "allow",
+                    "account_name": "Synthetic",
+                },
+                headers={"Origin": BASE},
+            )
             assert approval.status_code == 302
             callback = parse_qs(urlsplit(approval.headers["location"]).query)
             assert callback["state"] == ["synthetic-state"]
@@ -137,6 +151,14 @@ async def test_first_connect_code_completes_oauth_and_stays_scoped_after_reenrol
             async with streamable_http_client(RESOURCE, http_client=http) as streams:
                 async with ClientSession(streams[0], streams[1]) as session:
                     await session.initialize()
+                    profile = await session.call_tool("get_profile", {})
+                    assert not profile.isError
+                    assert profile.structuredContent == {
+                        "id": "7001",
+                        "name": "Synthetic",
+                        "nickname": "Synthetic",
+                    }
+                    assert json.loads(profile.content[0].text) == profile.structuredContent
                     result = await session.call_tool("find_users", {})
                     assert not result.isError
                     assert result.structuredContent["result"] == [user]

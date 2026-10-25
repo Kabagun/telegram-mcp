@@ -272,6 +272,37 @@ def test_search_is_literal_case_insensitive_and_covers_all_public_name_fields(st
     }
 
 
+def test_account_name_changes_only_label_and_survives_restart(store: Store, database: Path) -> None:
+    original = link(store)
+    renamed = store.set_display_name(original["user_key"], 123, "  Personal account 🏠  ")
+    assert renamed == {**original, "display_name": "Personal account 🏠"}
+    assert Store(database).get_user(original["user_key"]) == renamed
+
+
+@pytest.mark.parametrize("name", [None, False, 123, "", "  ", "x" * 129, "bad\nname", "\ud800"])
+def test_account_name_rejects_invalid_labels_without_changes(store: Store, name) -> None:
+    original = link(store)
+    with pytest.raises(ValueError, match="Account name is invalid"):
+        store.set_display_name(original["user_key"], 123, name)
+    assert store.get_user(original["user_key"]) == original
+
+
+def test_account_name_requires_current_active_exact_identity(store: Store) -> None:
+    original = link(store)
+    second = link(store, "second", 456)
+    for key, identity in (("missing", 123), (original["user_key"], 456)):
+        with pytest.raises(ValueError):
+            store.set_display_name(key, identity, "Other")
+    assert store.get_user(original["user_key"]) == original
+    assert store.get_user(second["user_key"]) == second
+    store.set_active_by_telegram(123, False)
+    with pytest.raises(ValueError):
+        store.set_display_name(original["user_key"], 123, "Inactive")
+    assert store.get_user(original["user_key"])["display_name"] == original["display_name"]
+    with pytest.raises(ValueError):
+        store.set_display_name(original["user_key"], True, "Invalid identity")
+
+
 def test_delete_revokes_invites_and_keeps_delivery_ledger(store: Store, database: Path) -> None:
     link(store)
     invitation = store.create_link("example", "Example")

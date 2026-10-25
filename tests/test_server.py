@@ -126,6 +126,7 @@ async def test_real_sdk_http_end_to_end_auth_link_send_dedup_optout_group(config
                         assert initialized.serverInfo.name == "Telegram"
                         tools = await session.list_tools()
                         assert {tool.name for tool in tools.tools} == {
+                            "get_profile",
                             "create_user_link",
                             "find_users",
                             "get_user",
@@ -211,7 +212,36 @@ async def test_official_memory_transport_tools(config):
         runtime = Runtime(config, bot=TelegramClient(TOKEN, client=client))
         async with runtime.lifespan():
             async with create_connected_server_and_client_session(create_mcp(runtime)) as session:
-                assert len((await session.list_tools()).tools) == 12
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                assert len(tools) == 13
+                profile = tools["get_profile"]
+                assert profile.meta == {"openai/profile": True}
+                assert profile.inputSchema["type"] == "object"
+                assert profile.inputSchema["properties"] == {}
+                assert not profile.inputSchema.get("required")
+                assert profile.outputSchema["type"] == "object"
+                assert profile.outputSchema["additionalProperties"] is False
+                assert set(profile.outputSchema["required"]) == {"id", "name", "nickname"}
+                assert all(
+                    value["type"] == "string"
+                    for value in profile.outputSchema["properties"].values()
+                )
+                read_only = {
+                    "get_profile",
+                    "find_users",
+                    "get_user",
+                    "list_messages",
+                    "get_message",
+                    "get_attachment",
+                }
+                for name, tool in tools.items():
+                    assert tool.annotations.readOnlyHint is (name in read_only)
+                    assert tool.annotations.destructiveHint is (name == "unlink_user")
+                    assert tool.annotations.idempotentHint is (name != "create_user_link")
+                    assert tool.annotations.openWorldHint is False
+                result = await session.call_tool("get_profile", {})
+                assert result.isError
+                assert "personal OAuth connection" in result.content[0].text
                 assert not (await session.call_tool("find_users", {})).isError
 
 
@@ -298,7 +328,10 @@ async def test_real_stdio_subprocess_sdk_protocol_without_real_telegram(tmp_path
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
             assert (await session.initialize()).serverInfo.name == "Telegram"
-            assert len((await session.list_tools()).tools) == 12
+            assert len((await session.list_tools()).tools) == 13
+            result = await session.call_tool("get_profile", {})
+            assert result.isError
+            assert "personal OAuth connection" in result.content[0].text
             assert structured(await session.call_tool("find_users", {})) == []
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import re
 import sqlite3
 from pathlib import Path
@@ -9,7 +10,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
-from mcp.server.auth.provider import TokenError
+from mcp.server.auth.provider import AuthorizationParams, TokenError
 from starlette.applications import Starlette
 
 from telegram_ping_mcp.oauth import (
@@ -43,6 +44,37 @@ def setup(tmp_path):
 @pytest.fixture
 async def client(setup):
     app = Starlette(routes=setup[0].create_routes())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=ISSUER, follow_redirects=False
+    ) as value:
+        yield value
+
+
+@pytest.fixture
+def account_name_setup(setup):
+    _, users, path = setup
+    calls = []
+
+    def set_account_name(user_key, telegram_user_id, name):
+        user = users[user_key]
+        assert user["active"] is True and user["telegram_user_id"] == telegram_user_id
+        user["display_name"] = name
+        calls.append((user_key, telegram_user_id, name))
+        return user
+
+    provider = OAuthProvider(
+        path,
+        issuer_url=ISSUER,
+        resource_url=RESOURCE,
+        get_user=users.get,
+        set_account_name=set_account_name,
+    )
+    return provider, users, path, calls
+
+
+@pytest.fixture
+async def account_name_client(account_name_setup):
+    app = Starlette(routes=account_name_setup[0].create_routes())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url=ISSUER, follow_redirects=False
     ) as value:
@@ -274,6 +306,243 @@ async def test_csrf_origin_and_cookie_fail_before_code_consumption(client, setup
             headers={"origin": ISSUER},
         )
     ).status_code == 403
+
+
+@pytest.mark.parametrize("username", ["synthetic_handle", "  synthetic_handle  "])
+async def test_telegram_username_skips_account_name_prompt(
+    account_name_client, account_name_setup, username
+):
+    provider, users, _, calls = account_name_setup
+    users["synthetic"]["username"] = username
+    registration = await register(account_name_client)
+    code, _, _ = await approve(account_name_client, provider, registration)
+    response = await exchange(account_name_client, registration, code)
+    assert response.status_code == 200
+    assert calls == []
+
+
+@pytest.mark.parametrize("username", [None, "", "   "])
+async def test_account_without_username_chooses_name_before_code_is_consumed(
+    account_name_client, account_name_setup, username
+):
+    client = account_name_client
+    provider, users, path, calls = account_name_setup
+    users["synthetic"].update(username=username, first_name="Synthetic private first name")
+    registration = await register(client)
+    fields, initial = await begin(client, registration)
+    assert "Как назвать аккаунт?" not in initial.text
+    assert "Synthetic private first name" not in initial.text
+    login = provider.issue_login_code("synthetic")
+    data = {**fields, "code": login, "decision": "allow"}
+    page = await client.post("/oauth/consent", data=data, headers={"origin": ISSUER})
+    assert page.status_code == 200
+    assert "Как назвать аккаунт?" in page.text and "Имя аккаунта" in page.text
+    assert "Synthetic private first name" not in page.text
+    assert page.headers["referrer-policy"] == "same-origin"
+    assert (
+        f"form-action 'self' {urlsplit(CALLBACK).scheme}://{urlsplit(CALLBACK).netloc};"
+        in (page.headers["content-security-policy"])
+    )
+    for name in ("request", "csrf"):
+        assert (
+            html.unescape(re.search(rf'name="{name}" value="([^"]+)"', page.text)[1])
+            == (fields[name])
+        )
+    normalized = provider._normalize_login(login)
+    assert re.search(r'name="code" value="([^"]+)"', page.text)[1] == normalized
+    assert client.cookies.get("__Secure-ai-connector-csrf") == fields["csrf"]
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+        assert login not in "\n".join(db.iterdump())
+        assert normalized not in "\n".join(db.iterdump())
+    assert calls == []
+    name = '  Synthetic <account> & "label"  '
+    approved = await client.post(
+        "/oauth/consent",
+        data={**data, "code": normalized, "account_name": name},
+        headers={"origin": ISSUER},
+    )
+    assert approved.status_code == 302, approved.text
+    assert calls == [("synthetic", 7001, name.strip())]
+    code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
+    response = await exchange(client, registration, code)
+    assert response.status_code == 200
+    token = await provider.load_access_token(response.json()["access_token"])
+    assert token.user_key == "synthetic" and token.telegram_user_id == 7001
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 0
+    fields, _ = await begin(client, registration)
+    assert (
+        await client.post(
+            "/oauth/consent",
+            data={**fields, "code": login, "account_name": "Synthetic", "decision": "allow"},
+            headers={"origin": ISSUER},
+        )
+    ).status_code == 400
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 129, "line\nfeed", "tab\tname", "nul\0name"])
+async def test_invalid_account_names_preserve_login_code(
+    account_name_client, account_name_setup, name
+):
+    provider, _, path, calls = account_name_setup
+    registration = await register(account_name_client)
+    fields, _ = await begin(account_name_client, registration)
+    login = provider.issue_login_code("synthetic")
+    response = await account_name_client.post(
+        "/oauth/consent",
+        data={**fields, "code": login, "account_name": name, "decision": "allow"},
+        headers={"origin": ISSUER},
+    )
+    assert response.status_code == 200
+    assert "Как назвать аккаунт?" in response.text
+    assert "без управляющих символов" in response.text
+    assert calls == []
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+
+
+async def test_account_name_form_escapes_hidden_fields():
+    value = '"><script>alert("synthetic")</script>&'
+    params = AuthorizationParams(
+        redirect_uri=CALLBACK,
+        redirect_uri_provided_explicitly=True,
+        code_challenge=CHALLENGE,
+        scopes=["telegram"],
+        state=None,
+    )
+    response = OAuthProvider._consent_form(params, value, value, login=value)
+    body = response.body.decode()
+    assert "<script>" not in body
+    assert body.count(html.escape(value, quote=True)) == 3
+
+
+async def test_account_name_callback_failures_are_generic_and_keep_code(
+    account_name_client, account_name_setup
+):
+    provider, _, path, _ = account_name_setup
+
+    def unavailable(*args):
+        raise RuntimeError("Synthetic private failure details")
+
+    provider.set_account_name = unavailable
+    registration = await register(account_name_client)
+    fields, _ = await begin(account_name_client, registration)
+    login = provider.issue_login_code("synthetic")
+    response = await account_name_client.post(
+        "/oauth/consent",
+        data={**fields, "code": login, "account_name": "Synthetic", "decision": "allow"},
+        headers={"origin": ISSUER},
+    )
+    assert response.status_code == 400
+    assert "Не удалось сохранить имя аккаунта" in response.text
+    assert "Synthetic private failure details" not in response.text
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("changed", [{"active": False}, {"telegram_user_id": 7999}])
+async def test_account_identity_is_rechecked_after_name_save(
+    account_name_client, account_name_setup, changed
+):
+    provider, users, path, _ = account_name_setup
+
+    def changed_identity(user_key, telegram_user_id, name):
+        users[user_key].update(changed)
+        return users[user_key]
+
+    provider.set_account_name = changed_identity
+    registration = await register(account_name_client)
+    fields, _ = await begin(account_name_client, registration)
+    login = provider.issue_login_code("synthetic")
+    response = await account_name_client.post(
+        "/oauth/consent",
+        data={**fields, "code": login, "account_name": "Synthetic", "decision": "allow"},
+        headers={"origin": ISSUER},
+    )
+    assert response.status_code == 400
+    assert "Не удалось сохранить имя аккаунта" in response.text
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"active": False}, {"telegram_user_id": 7999}, {"user_key": "second"}, {"chat_id": 7002}],
+)
+async def test_account_name_step_rechecks_code_owner_before_callback(
+    account_name_client, account_name_setup, changed
+):
+    client = account_name_client
+    provider, users, path, calls = account_name_setup
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    login = provider.issue_login_code("synthetic")
+    data = {**fields, "code": login, "decision": "allow"}
+    assert (
+        await client.post("/oauth/consent", data=data, headers={"origin": ISSUER})
+    ).status_code == 200
+    users["synthetic"].update(changed)
+    response = await client.post(
+        "/oauth/consent",
+        data={**data, "account_name": "Synthetic"},
+        headers={"origin": ISSUER},
+    )
+    assert response.status_code == 400
+    assert "Код недействителен" in response.text
+    assert calls == []
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
+
+
+async def test_account_name_step_keeps_origin_csrf_and_denial_guards(
+    account_name_client, account_name_setup
+):
+    client = account_name_client
+    provider, _, path, calls = account_name_setup
+    registration = await register(client)
+    fields, _ = await begin(client, registration)
+    login = provider.issue_login_code("synthetic")
+    data = {**fields, "code": login, "decision": "allow"}
+    # An invalid code must not reveal the naming step or call the identity store.
+    invalid = await client.post(
+        "/oauth/consent", data={**data, "code": "invalid"}, headers={"origin": ISSUER}
+    )
+    assert invalid.status_code == 400 and "Как назвать аккаунт?" not in invalid.text
+    assert (
+        await client.post("/oauth/consent", data=data, headers={"origin": ISSUER})
+    ).status_code == 200
+    data["account_name"] = "Synthetic"
+    for origin in (None, "null", "https://attacker.example.test"):
+        headers = {"origin": origin} if origin is not None else {}
+        assert (await client.post("/oauth/consent", data=data, headers=headers)).status_code == 403
+    assert (
+        await client.post(
+            "/oauth/consent", data={**data, "csrf": "bad"}, headers={"origin": ISSUER}
+        )
+    ).status_code == 403
+    cookie = client.cookies.get("__Secure-ai-connector-csrf")
+    client.cookies.clear()
+    assert (
+        await client.post("/oauth/consent", data=data, headers={"origin": ISSUER})
+    ).status_code == 403
+    client.cookies.set(
+        "__Secure-ai-connector-csrf", cookie, domain="connector.example.test", path="/oauth/consent"
+    )
+    denied = await client.post(
+        "/oauth/consent", data={**fields, "decision": "deny"}, headers={"origin": ISSUER}
+    )
+    assert denied.status_code == 302
+    assert parse_qs(urlsplit(denied.headers["location"]).query)["error"] == ["access_denied"]
+    assert calls == []
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM login_codes").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM codes").fetchone()[0] == 0
 
 
 async def test_pkce_redirect_client_and_resource_isolation(client, setup):

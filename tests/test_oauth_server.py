@@ -22,6 +22,7 @@ BETA = "synthetic-beta"
 GROUP = -100123
 FILE_BYTES = b"Synthetic fixture attachment"
 TOOLS = {
+    "get_profile",
     "create_user_link",
     "find_users",
     "get_user",
@@ -114,9 +115,12 @@ async def running_server(tmp_path, *, oauth_enabled=True):
         app = create_http_app(runtime)
         async with app.router.lifespan_context(app):
             store = runtime.service.store
-            for user_key, user_id in ((ALPHA, 7001), (BETA, 7002)):
-                link = store.create_link(user_key, user_key)
-                store.consume_link(link["token"], user_id, user_id, None, user_key)
+            for user_key, user_id, username, display_name in (
+                (ALPHA, 7001, "synthetic_alpha", "Alpha connection"),
+                (BETA, 7002, None, "Beta connection"),
+            ):
+                link = store.create_link(user_key, display_name)
+                store.consume_link(link["token"], user_id, user_id, username, user_key)
             for user_id, message_id, group in (
                 (7001, 11, False),
                 (7002, 12, False),
@@ -178,6 +182,38 @@ async def connected(fixture, name):
 def link_count(fixture):
     with sqlite3.connect(fixture.runtime.config.database_path) as database:
         return database.execute("SELECT COUNT(*) FROM link_tokens").fetchone()[0]
+
+
+async def test_oauth_profile_returns_only_connected_account_with_direct_json(server):
+    async with server() as server:
+        for account, user_id, label in (
+            ("alpha", "7001", "@synthetic_alpha"),
+            ("beta", "7002", "Beta connection"),
+        ):
+            async with connected(server, account) as session:
+                result = await session.call_tool("get_profile", {})
+                assert not result.isError
+                expected = {"id": user_id, "name": label, "nickname": label}
+                assert result.structuredContent == expected
+                assert len(result.content) == 1
+                assert result.content[0].type == "text"
+                assert json.loads(result.content[0].text) == expected
+        assert server.telegram.calls == []
+
+
+async def test_oauth_profile_id_survives_account_label_changes(server):
+    async with server() as server:
+        async with connected(server, "beta") as session:
+            before = await session.call_tool("get_profile", {})
+            server.runtime.oauth.set_account_name(BETA, 7002, "Chosen account name")
+            after = await session.call_tool("get_profile", {})
+            assert payload(before)["id"] == payload(after)["id"] == "7002"
+            assert payload(after) == {
+                "id": "7002",
+                "name": "Chosen account name",
+                "nickname": "Chosen account name",
+            }
+        assert server.telegram.calls == []
 
 
 async def test_oauth_tools_reject_foreign_and_group_resources_before_side_effects(server):
@@ -350,6 +386,9 @@ async def test_oauth_delivery_request_ids_are_independent_per_user(server):
 async def test_legacy_master_retains_all_tools_and_group_access(server):
     async with server() as server:
         async with connected(server, "legacy") as session:
+            result = await session.call_tool("get_profile", {})
+            assert result.isError
+            assert "personal OAuth connection" in result.content[0].text
             assert (
                 payload(
                     await session.call_tool(

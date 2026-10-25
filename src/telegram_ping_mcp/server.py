@@ -19,7 +19,8 @@ from urllib.parse import quote, urlsplit
 from mcp.server.auth.routes import build_resource_metadata_url, create_protected_resource_routes
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
-from pydantic import AnyHttpUrl
+from mcp.types import ToolAnnotations
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -37,6 +38,23 @@ from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 logger = logging.getLogger(__name__)
+
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_IDEMPOTENT_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+
+
+class Profile(BaseModel):
+    """Account identity returned directly in the MCP profile contract."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str
+    name: str
+    nickname: str
 
 
 class StartupError(RuntimeError):
@@ -102,6 +120,9 @@ class Runtime:
                 issuer_url=f"{public.scheme}://{public.netloc}",
                 resource_url=resource_url,
                 get_user=lambda key: self.service.get_user(key) if self.service else None,
+                set_account_name=lambda key, telegram_id, name: (
+                    self.require_service().store.set_display_name(key, telegram_id, name)
+                ),
             )
 
     @contextlib.asynccontextmanager
@@ -317,7 +338,36 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         ),
     )
 
-    @mcp.tool()
+    @mcp.tool(meta={"openai/profile": True}, annotations=_READ_ONLY)
+    def get_profile() -> Profile:
+        """Get the connected Telegram account's stable identity and account label."""
+        identity = principal()
+        if identity is None:
+            raise ValueError("This tool requires a personal OAuth connection.")
+        user = runtime.require_service().get_user(identity["user_key"])
+        if (
+            user is None
+            or not user.get("active")
+            or user.get("telegram_user_id") != identity["telegram_user_id"]
+        ):
+            raise ValueError("Access denied.")
+        username = str(user.get("username") or "").strip().lstrip("@")
+        label = (
+            "@" + username
+            if username
+            else (
+                str(user.get("display_name") or "").strip()
+                or str(user.get("first_name") or "").strip()
+                or "Telegram user"
+            )
+        )
+        return Profile(id=str(identity["telegram_user_id"]), name=label, nickname=label)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+        )
+    )
     def create_user_link(
         user_key: str, display_name: str, ttl_seconds: int | None = None
     ) -> dict[str, Any]:
@@ -326,7 +376,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             raise ValueError("This tool requires operator access.")
         return runtime.require_service().create_user_link(user_key, display_name, ttl_seconds)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_READ_ONLY)
     def find_users(query: str = "", limit: int = 50) -> list[dict[str, Any]]:
         """Find confirmed bindings by user key, display name or Telegram name; limit 1..100."""
         identity = principal()
@@ -343,26 +393,30 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             return []
         return runtime.require_service().find_users(query, limit)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_READ_ONLY)
     def get_user(user_key: str) -> dict[str, Any] | None:
         """Get a confirmed binding, including whether notifications are enabled."""
         require_user(user_key)
         return runtime.require_service().get_user(user_key)
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
     def unlink_user(user_key: str) -> dict[str, Any]:
         """Remove a binding and invalidate its pending invitations."""
         require_user(user_key)
         return runtime.require_service().unlink_user(user_key)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_IDEMPOTENT_WRITE)
     async def ping_user(user_key: str, text: str, request_id: str) -> dict[str, Any]:
         """Send one plain-text DM as the bot. Reuse request_id for retries to prevent duplicates."""
         require_user(user_key)
         result = await runtime.require_service().ping_user(user_key, text, _request_id(request_id))
         return _delivery_result(result, request_id)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_IDEMPOTENT_WRITE)
     async def ping_group(
         chat_id: int,
         user_keys: list[str],
@@ -377,7 +431,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             chat_id, user_keys, text, request_id, topic_id
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=_READ_ONLY)
     def list_messages(
         user_key: str | None = None,
         chat_id: int | None = None,
@@ -397,7 +451,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             chat_id = require_private_chat(chat_id)
         return runtime.require_inbox().list_messages(user_key, chat_id, after_id, limit)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_READ_ONLY)
     def get_message(message_id: int) -> dict[str, Any] | None:
         """Get an incoming inbox item, including sender and attachment metadata."""
         message = runtime.require_inbox().get_message(message_id)
@@ -405,14 +459,14 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             require_message(message)
         return message
 
-    @mcp.tool()
+    @mcp.tool(annotations=_IDEMPOTENT_WRITE)
     def mark_read(message_id: int) -> dict[str, Any]:
         """Mark an inbox item processed locally. This does not change Telegram read receipts."""
         if is_oauth():
             require_message(runtime.require_inbox().get_message(message_id))
         return runtime.require_inbox().mark_read(message_id)
 
-    @mcp.tool(structured_output=False)
+    @mcp.tool(structured_output=False, annotations=_READ_ONLY)
     async def get_attachment(attachment_id: str) -> list[AttachmentContent]:
         """Read an attachment. Small files return inline content, large files an authenticated path.
 
@@ -430,7 +484,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         async with runtime.download_lock:
             return attachment_content(await runtime.inbound.read_attachment(attachment_id))
 
-    @mcp.tool()
+    @mcp.tool(annotations=_IDEMPOTENT_WRITE)
     async def reply_message(message_id: int, text: str, request_id: str) -> dict[str, Any]:
         """Reply as the bot to an inbox ID, retaining its chat, reply target and topic.
 
@@ -446,7 +500,7 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         )
         return _delivery_result(result, request_id)
 
-    @mcp.tool()
+    @mcp.tool(annotations=_IDEMPOTENT_WRITE)
     async def reply_attachment(
         message_id: int, request_id: str, caption: str = ""
     ) -> dict[str, Any]:
