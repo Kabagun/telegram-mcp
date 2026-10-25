@@ -16,13 +16,39 @@ PRIVACY_NOTICE = (
 
 _NAME = "Telegram"
 _DESCRIPTION = "Уведомления, ответы и файлы через Telegram-бота."
-_CHATGPT_HEADING = "1️⃣ Откройте ChatGPT"
+_CLIENT_HEADINGS = {
+    "chatgpt": "Подключение к ChatGPT",
+    "claude": "Подключение к Claude",
+    "other": "Другое AI-приложение",
+}
+CALLBACK_ACTIONS = frozenset(
+    {
+        "ui:menu",
+        "ui:connect",
+        "ui:chatgpt",
+        "ui:claude",
+        "ui:other",
+        "ui:help",
+        "ui:help_chatgpt",
+        "ui:help_claude",
+        "ui:help_other",
+        "ui:privacy",
+        "ui:start",
+        "ui:stop",
+        "ui:unlink",
+        "ui:unlink_confirm",
+    }
+)
+BUTTON_ACTIONS = {
+    "🔌 Подключить": "ui:connect",
+    "⏸ Пауза": "ui:stop",
+    "🔔 Включить": "ui:start",
+    "🔗 Отключить": "ui:unlink",
+    "ℹ️ Помощь": "ui:help",
+}
 _SECTION_HEADINGS = {
-    _CHATGPT_HEADING,
-    "2️⃣ Заполните поля",
-    "3️⃣ Завершите подключение",
-    "Claude",
-    "🔒 Доступ и приватность",
+    *_CLIENT_HEADINGS.values(),
+    "Настройки плагина",
     "🔑 Код подключения",
 }
 
@@ -47,7 +73,8 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
     The caller must pass the final text so login codes retain exact offsets.
     """
     lines = text.split("\n")
-    if _CHATGPT_HEADING not in lines:
+    client = next((key for key, heading in _CLIENT_HEADINGS.items() if heading in lines), None)
+    if client is None:
         return [], None
 
     entities = []
@@ -106,8 +133,17 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
         if value and _utf16_length(value) <= 256:
             buttons.append({"text": label, "copy_text": {"text": value}})
     keyboard = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    keyboard.append(
+        [
+            {"text": "Как подключить", "callback_data": f"ui:help_{client}"},
+            {"text": "Другое приложение", "callback_data": "ui:connect"},
+        ]
+    )
+    navigation = [{"text": "Приватность", "callback_data": "ui:privacy"}]
     if endpoint:
-        keyboard.append([{"text": "Скачать PNG", "url": _icon_download_url(endpoint)}])
+        navigation.append({"text": "Скачать PNG", "url": _icon_download_url(endpoint)})
+    navigation.append({"text": "Меню", "callback_data": "ui:menu"})
+    keyboard.append(navigation)
     return entities, {"inline_keyboard": keyboard} if keyboard else None
 
 
@@ -126,12 +162,7 @@ def command_menu(*, linked: bool = False) -> list[dict[str, str]]:
 
 def intro_text(*, linked: bool) -> str:
     """Introduce the product briefly, with actions appropriate to the binding."""
-    actions = (
-        "/start — включить уведомления; /stop — отключить; /unlink — удалить привязку. "
-        "Инструкция подключения — /connect."
-        if linked
-        else "Чтобы подключить AI-чат, используйте /connect."
-    )
+    actions = "Управляйте связью кнопками ниже." if linked else "Нажмите «🔌 Подключить» ниже."
     return (
         "AI Connector соединяет Telegram с вашим AI-чатом. Чат может присылать "
         "уведомления и сообщения, читать ваши ответы и файлы.\n\n" + actions
@@ -139,47 +170,138 @@ def intro_text(*, linked: bool) -> str:
 
 
 def onboarding_text(
-    public_mcp_url: str = "", *, linked: bool = False, login_code: str | None = None
+    public_mcp_url: str = "",
+    *,
+    linked: bool = False,
+    login_code: str | None = None,
+    client: str = "chatgpt",
 ) -> str:
     """Return one plain-text Telegram message, also safe with a maximum-length URL."""
     endpoint = normalize_public_mcp_url(public_mcp_url)
+    if client not in _CLIENT_HEADINGS:
+        raise ValueError("Unknown AI application.")
+    if login_code is not None and (
+        not isinstance(login_code, str)
+        or not login_code.strip()
+        or len(login_code) > 128
+        or any(unicodedata.category(char) in {"Cc", "Cs"} for char in login_code)
+    ):
+        raise ValueError("Login code is invalid.")
     address = endpoint or "адрес подключения запросите у владельца."
     code_section = (
-        "🔑 Код подключения\n"
-        f"Код входа: {login_code}\n"
-        "Без срока действия. Используется один раз.\n"
-        "Скопируйте код в окно подключения.\n\n"
+        f"🔑 Код подключения\nКод входа: {login_code}\nБез срока действия · одноразовый.\n\n"
         if login_code is not None
         else ""
     )
-    privacy = (
-        "• Плагин работает только с вашим чатом с ботом. Он не входит в Telegram-аккаунт "
-        "и не видит остальные переписки, контакты и группы.\n"
-        "• Подключённое AI-приложение может читать сообщения и файлы, которые вы отправляете "
-        "этому боту, и присылать вам ответы.\n"
-        "• Другие пользователи не видят ваши данные. Передача защищена HTTPS, "
-        "доступ подтверждаете вы.\n"
-        "• Отключить — /unlink."
-    )
     return (
-        f"{_CHATGPT_HEADING}\n"
-        "https://chatgpt.com/ → Плагины → +\n"
-        "Добавить пользовательский сервер MCP\n\n"
-        "2️⃣ Заполните поля\n"
+        f"{_CLIENT_HEADINGS[client]}\n\n"
+        "Настройки плагина\n"
         f"Название: {_NAME}\n"
-        f"Описание: {_DESCRIPTION}\n"
-        "Подключение: URL-адрес сервера\n"
         f"URL-адрес сервера: {address}\n"
         "Аутентификация: OAuth\n\n"
         f"{code_section}"
-        "3️⃣ Завершите подключение\n"
-        "«Я понимаю и хочу продолжить» → «Создать в виде плагина».\n"
-        "Установите плагин. В AI-чате выберите @Telegram.\n"
-        "В окне подключения введите код из бота и разрешите доступ.\n\n"
-        "📎 Иконка PNG — файлом ниже.\n"
-        "Загрузите её в «Значок» (256×256, до 10 КБ).\n\n"
-        "Claude\n"
-        "https://claude.ai/ → Settings → Connectors → Add custom connector.\n"
-        "Name: Telegram; Server URL: адрес выше; Authentication: OAuth.\n\n"
-        "🔒 Доступ и приватность\n" + privacy
+        "Вставьте код в окне подключения.\n"
+        "📎 Иконка PNG — файлом ниже."
+    )
+
+
+def menu_keyboard(*, linked: bool = False, active: bool = True) -> dict:
+    rows = [[{"text": "🔌 Подключить"}]]
+    if linked:
+        rows[0].append({"text": "⏸ Пауза" if active else "🔔 Включить"})
+        rows.append([{"text": "🔗 Отключить"}, {"text": "ℹ️ Помощь"}])
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
+def client_picker() -> tuple[str, dict]:
+    return "Куда подключаем Telegram?", {
+        "inline_keyboard": [
+            [
+                {"text": "ChatGPT", "callback_data": "ui:chatgpt"},
+                {"text": "Claude", "callback_data": "ui:claude"},
+            ],
+            [{"text": "Другое", "callback_data": "ui:other"}],
+            [{"text": "Меню", "callback_data": "ui:menu"}],
+        ]
+    }
+
+
+def help_presentation(client: str | None = None) -> tuple[str, dict]:
+    if client is None:
+        return (
+            "Как это работает\n\nНажмите «🔌 Подключить» и выберите AI-приложение. "
+            "Добавьте в него Telegram по карточке настроек.\n\n"
+            "AI-чат сможет присылать уведомления, читать ваши ответы и файлы. "
+            "Модель выбирается в AI-приложении.",
+            client_picker()[1],
+        )
+    descriptions = {
+        "chatgpt": (
+            "Как подключить ChatGPT\n\n"
+            "1. chatgpt.com → Плагины → + → Добавить пользовательский сервер MCP.\n"
+            "2. Перенесите название, URL и OAuth из карточки настроек.\n"
+            "3. Создайте плагин и вставьте код в окне подключения.\n\n"
+            "Если нужен значок, загрузите PNG-файл из этого чата."
+        ),
+        "claude": (
+            "Как подключить Claude\n\n"
+            "claude.ai → Settings → Connectors → Add custom connector.\n\n"
+            "Укажите название и URL из карточки настроек. "
+            "В окне OAuth введите код подключения."
+        ),
+        "other": (
+            "Как подключить другое AI-приложение\n\n"
+            "Добавьте удалённый MCP-сервер по URL из карточки настроек. "
+            "Выберите OAuth и введите код в открывшемся окне.\n\n"
+            "Модель выбирается в вашем AI-приложении."
+        ),
+    }
+    if client not in descriptions:
+        raise ValueError("Unknown AI application.")
+    row = []
+    if client in {"chatgpt", "claude"}:
+        row.append(
+            {
+                "text": "Открыть сайт",
+                "url": "https://chatgpt.com/" if client == "chatgpt" else "https://claude.ai/",
+            }
+        )
+    row.append({"text": "Выбрать приложение", "callback_data": "ui:connect"})
+    return descriptions[client], {
+        "inline_keyboard": [
+            row,
+            [
+                {"text": "Приватность", "callback_data": "ui:privacy"},
+                {"text": "Меню", "callback_data": "ui:menu"},
+            ],
+        ]
+    }
+
+
+def privacy_presentation() -> tuple[str, dict]:
+    text = PRIVACY_NOTICE.replace(
+        "Отключить — /unlink.", "Отключить связь можно кнопкой «🔗 Отключить»."
+    )
+    return "Доступ и приватность\n\n" + text, {
+        "inline_keyboard": [
+            [
+                {"text": "Подключить", "callback_data": "ui:connect"},
+                {"text": "Меню", "callback_data": "ui:menu"},
+            ]
+        ]
+    }
+
+
+def unlink_presentation() -> tuple[str, dict]:
+    return (
+        "Отключить AI-чат?\n\nПривязка и выданный доступ будут удалены. "
+        "Подключиться заново можно кнопкой «🔌 Подключить».",
+        {
+            "inline_keyboard": [
+                [
+                    {"text": "Да, отключить", "callback_data": "ui:unlink_confirm"},
+                    {"text": "Отмена", "callback_data": "ui:menu"},
+                ]
+            ]
+        },
     )

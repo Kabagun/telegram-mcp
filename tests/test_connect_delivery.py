@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from telegram_ping_mcp.onboarding import command_menu, onboarding_presentation
+from telegram_ping_mcp.onboarding import command_menu, menu_keyboard, onboarding_presentation
 from telegram_ping_mcp.service import Service
 from telegram_ping_mcp.store import Store
 from telegram_ping_mcp.telegram import TelegramAPIError, TelegramTransportError
@@ -13,7 +13,7 @@ from telegram_ping_mcp.telegram import TelegramAPIError, TelegramTransportError
 PUBLIC_URL = "https://connector.example.test/mcp"
 ICON_NOTE = "📎 Иконка PNG — файлом ниже."
 ICON_FAILURE = (
-    "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите /connect."
+    "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите подключение."
 )
 
 
@@ -41,8 +41,8 @@ class FakeBot:
             raise failure
         return {"message_id": len(self.events), "chat": {"id": chat_id}}
 
-    async def send_connector_icon(self, chat_id: int) -> dict:
-        event = {"kind": "document", "chat_id": chat_id}
+    async def send_connector_icon(self, chat_id: int, **kwargs) -> dict:
+        event = {"kind": "document", "chat_id": chat_id, **kwargs}
         self.events.append(event)
         self.documents.append(event)
         if self.icon_failure is not None:
@@ -115,6 +115,9 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_e
     else:
         assert guide["reply_markup"] == markup
     assert bot.events[-1]["commands"] == command_menu(linked=True)
+    assert bot.documents[0]["reply_markup"] == menu_keyboard(
+        linked=True, active=active is not False
+    )
     if active is None:
         users = store.list_users()
         assert len(users) == 1
@@ -131,18 +134,15 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_e
         assert "Код входа: synthetic-code-1\n" in guide["text"]
         sections = (
             "Название: Telegram\n",
-            "Описание: Уведомления, ответы и файлы через Telegram-бота.\n",
             f"URL-адрес сервера: {PUBLIC_URL}\n",
             "Аутентификация: OAuth\n\n🔑 Код подключения\n",
             "Код входа: synthetic-code-1\n",
-            "3️⃣ Завершите подключение\n",
+            "Вставьте код в окне подключения.\n",
             ICON_NOTE,
-            "Claude\n",
-            "🔒 Доступ и приватность\n",
         )
         offsets = [guide["text"].index(section) for section in sections]
         assert offsets == sorted(offsets)
-        assert "Без срока действия. Используется один раз." in guide["text"]
+        assert "Без срока действия · одноразовый." in guide["text"]
         assert "10 минут" not in guide["text"]
         assert "приглашение" not in guide["text"]
         assert any(entity["type"] == "bold" for entity in entities)
@@ -201,7 +201,12 @@ async def test_failed_icon_sends_one_safe_fallback_and_preserves_binding(
         "menu",
     ]
     assert len(bot.documents) == 1
-    assert bot.sends[1] == {"kind": "message", "chat_id": 7001, "text": ICON_FAILURE}
+    assert bot.sends[1] == {
+        "kind": "message",
+        "chat_id": 7001,
+        "text": ICON_FAILURE,
+        "reply_markup": menu_keyboard(linked=True),
+    }
     assert "synthetic-private" not in str(bot.sends)
     assert "synthetic-private" not in caplog.text
     assert issued == ["synthetic"]
@@ -268,7 +273,9 @@ async def test_other_commands_keep_plain_replies_and_never_send_icon(tmp_path, t
 
     assert [event["kind"] for event in bot.events] == ["message", "menu"]
     assert "entities" not in bot.sends[0]
-    assert "reply_markup" not in bot.sends[0]
+    assert bot.sends[0]["reply_markup"] == menu_keyboard(
+        linked=text != "/unlink", active=text != "/stop"
+    )
     assert bot.documents == []
     assert issued == []
 

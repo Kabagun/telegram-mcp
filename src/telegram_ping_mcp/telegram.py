@@ -1,6 +1,7 @@
 """Small Telegram Bot API client with safe, content-free exceptions."""
 
 import asyncio
+import json
 import os
 import re
 import stat
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .config import DEFAULT_API_BASE_URL, MAX_ATTACHMENT_BYTES, normalize_api_base_url
+from .onboarding import BUTTON_ACTIONS, CALLBACK_ACTIONS
 
 TELEGRAM_MAX_FILE_BYTES = 20 * 1024 * 1024
 _FILE_PATH = re.compile(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+\Z")
@@ -114,11 +116,19 @@ def _valid_button_url(value: object) -> bool:
 
 
 def _validate_reply_markup(reply_markup: object) -> None:
-    """Allow only bounded copy buttons and ordinary HTTPS link buttons."""
+    """Allow bounded copy/link buttons and the bot's static navigation actions."""
     invalid = "Telegram reply markup is invalid."
-    if not isinstance(reply_markup, dict) or set(reply_markup) != {"inline_keyboard"}:
+    if not isinstance(reply_markup, dict):
         raise ValueError(invalid)
-    rows = reply_markup["inline_keyboard"]
+    is_reply_keyboard = set(reply_markup) == {"keyboard", "resize_keyboard", "is_persistent"}
+    if is_reply_keyboard:
+        if reply_markup["resize_keyboard"] is not True or reply_markup["is_persistent"] is not True:
+            raise ValueError(invalid)
+        rows = reply_markup["keyboard"]
+    elif set(reply_markup) == {"inline_keyboard"}:
+        rows = reply_markup["inline_keyboard"]
+    else:
+        raise ValueError(invalid)
     if not isinstance(rows, list) or not 1 <= len(rows) <= 4:
         raise ValueError(invalid)
     for row in rows:
@@ -127,12 +137,21 @@ def _validate_reply_markup(reply_markup: object) -> None:
         for button in row:
             if not isinstance(button, dict) or not _valid_button_text(button.get("text"), 64):
                 raise ValueError(invalid)
-            if set(button) == {"text", "copy_text"}:
+            if is_reply_keyboard:
+                if set(button) != {"text"} or button["text"] not in BUTTON_ACTIONS:
+                    raise ValueError(invalid)
+            elif set(button) == {"text", "copy_text"}:
                 copy_text = button["copy_text"]
                 if (
                     not isinstance(copy_text, dict)
                     or set(copy_text) != {"text"}
                     or not _valid_button_text(copy_text["text"], 256)
+                ):
+                    raise ValueError(invalid)
+            elif set(button) == {"text", "callback_data"}:
+                if (
+                    not isinstance(button["callback_data"], str)
+                    or button["callback_data"] not in CALLBACK_ACTIONS
                 ):
                     raise ValueError(invalid)
             elif set(button) != {"text", "url"} or not _valid_button_url(button["url"]):
@@ -241,6 +260,28 @@ class TelegramClient:
             raise TelegramAPIError(502)
         return result
 
+    async def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        """Acknowledge one bounded callback in a single attempt."""
+        if (
+            not isinstance(callback_query_id, str)
+            or not 1 <= len(callback_query_id) <= 256
+            or any(not 33 <= ord(character) <= 126 for character in callback_query_id)
+        ):
+            raise ValueError("Telegram callback query identifier is invalid.")
+        payload = {"callback_query_id": callback_query_id}
+        if text is not None:
+            if (
+                not isinstance(text, str)
+                or len(text) > 200
+                or any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in text)
+                or len(text.encode("utf-16-le")) // 2 > 200
+            ):
+                raise ValueError("Telegram callback query text is invalid.")
+            payload["text"] = text
+        result = await self._call("answerCallbackQuery", payload)
+        if result is not True:
+            raise TelegramAPIError(502)
+
     async def set_commands(
         self, commands: list[dict[str, str]], *, chat_id: int | None = None
     ) -> None:
@@ -320,10 +361,16 @@ class TelegramClient:
             raise TelegramTransportError()
         return result
 
-    async def send_connector_icon(self, chat_id: int) -> dict[str, Any]:
+    async def send_connector_icon(
+        self, chat_id: int, *, reply_markup: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Upload the packaged connector icon to one private chat in a single attempt."""
         if not _is_int(chat_id) or not 1 <= chat_id <= 2**63 - 1:
             raise ValueError("Telegram connector icon chat identifier is invalid.")
+        payload: dict[str, Any] = {"chat_id": chat_id, "caption": _CONNECTOR_ICON_CAPTION}
+        if reply_markup is not None:
+            _validate_reply_markup(reply_markup)
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         icon = None
         try:
             resource = resources.files("telegram_ping_mcp").joinpath("static", "telegram-icon.png")
@@ -340,7 +387,7 @@ class TelegramClient:
             raise ValueError("Packaged Telegram connector icon is unavailable or invalid.")
         result = await self._call(
             "sendDocument",
-            {"chat_id": chat_id, "caption": _CONNECTOR_ICON_CAPTION},
+            payload,
             files={"document": ("telegram-icon.png", icon, "image/png")},
         )
         if (
@@ -533,7 +580,7 @@ class TelegramClient:
             {
                 "offset": offset,
                 "timeout": timeout,
-                "allowed_updates": ["message", "my_chat_member"],
+                "allowed_updates": ["message", "callback_query"],
             },
             read_timeout=timeout + 10.0,
         )

@@ -9,10 +9,15 @@ import pytest
 
 from telegram_ping_mcp.config import Config, ConfigError
 from telegram_ping_mcp.onboarding import (
+    BUTTON_ACTIONS,
     PRIVACY_NOTICE,
+    client_picker,
     command_menu,
+    help_presentation,
+    menu_keyboard,
     onboarding_presentation,
     onboarding_text,
+    privacy_presentation,
 )
 from telegram_ping_mcp.server import Runtime
 from telegram_ping_mcp.service import Service, ServiceError
@@ -29,6 +34,7 @@ class FakeBot:
         self.sends: list[dict] = []
         self.documents: list[dict] = []
         self.command_menus: list[dict] = []
+        self.acknowledgements: list[str] = []
         self.failure = failure
         self.menu_failure = menu_failure
 
@@ -41,14 +47,17 @@ class FakeBot:
             raise self.failure
         return {"message_id": len(self.sends), "chat": {"id": chat_id}}
 
-    async def send_connector_icon(self, chat_id: int) -> dict:
-        self.documents.append({"chat_id": chat_id})
+    async def send_connector_icon(self, chat_id: int, **kwargs) -> dict:
+        self.documents.append({"chat_id": chat_id, **kwargs})
         return {"message_id": len(self.sends) + len(self.documents), "chat": {"id": chat_id}}
 
     async def set_commands(self, commands: list[dict], *, chat_id: int | None = None) -> None:
         self.command_menus.append({"commands": copy.deepcopy(commands), "chat_id": chat_id})
         if self.menu_failure is not None:
             raise self.menu_failure
+
+    async def answer_callback_query(self, query_id: str) -> None:
+        self.acknowledgements.append(query_id)
 
     async def aclose(self) -> None:
         pass
@@ -65,6 +74,27 @@ def command(text: str) -> dict:
     }
 
 
+def callback(action: str, *, telegram_id: int = 7001, query_id: str = "synthetic-query") -> dict:
+    return {
+        "update_id": 2,
+        "callback_query": {
+            "id": query_id,
+            "from": {"id": telegram_id, "is_bot": False, "first_name": "Synthetic"},
+            "message": {
+                "message_id": 17,
+                "date": 1,
+                "chat": {"type": "private", "id": telegram_id},
+                "from": {"id": 9999, "is_bot": True, "username": "synthetic_bot"},
+            },
+            "data": action,
+        },
+    }
+
+
+def button(action: str) -> str:
+    return next(label for label, target in BUTTON_ACTIONS.items() if target == action)
+
+
 @pytest.fixture
 def setup(tmp_path: Path) -> tuple[Service, Store, FakeBot]:
     store = Store(tmp_path / "onboarding.sqlite3")
@@ -78,30 +108,24 @@ def bind(store: Store) -> None:
 
 
 def assert_guide(text: str, *, linked: bool = False) -> None:
+    assert text.startswith("Подключение к ChatGPT\n\nНастройки плагина\n")
     assert f"URL-адрес сервера: {PUBLIC_URL}\n" in text
-    assert "https://claude.ai/" in text
-    assert "https://chatgpt.com/" in text
-    assert "Плагины → +\nДобавить пользовательский сервер MCP" in text
     assert "Название: Telegram\n" in text
-    assert "Описание: Уведомления, ответы и файлы через Telegram-бота." in text
     assert "📎 Иконка PNG — файлом ниже." in text
-    assert "Загрузите её в «Значок» (256×256, до 10 КБ)" in text
-    assert "Подключение: URL-адрес сервера" in text
     assert "Аутентификация: OAuth" in text
-    assert "3️⃣ Завершите подключение" in text
-    for removed in ("DCR", "Scope", "Client ID", "Client Secret", "OIDC"):
-        assert removed not in text
-    assert "«Я понимаю и хочу продолжить» → «Создать в виде плагина»" in text
-    assert "Установите плагин" in text
-    assert "В AI-чате выберите @Telegram" in text
-    assert "Settings → Connectors → Add custom connector" in text
-    assert "Name: Telegram; Server URL: адрес выше; Authentication: OAuth." in text
-    assert "введите код из бота и разрешите доступ" in text
+    assert "Вставьте код в окне подключения." in text
     assert "приглашение" not in text
-    assert "нажмите Start" not in text
-    assert "Затем отправьте /connect, чтобы получить код входа" not in text
-    assert text.count("https://") == 3
+    assert text.count("https://") == 1
     for removed in (
+        "DCR",
+        "Scope",
+        "Client ID",
+        "Client Secret",
+        "OIDC",
+        "Описание:",
+        "Claude",
+        "Доступ и приватность",
+        "/unlink",
         "Streamable",
         "Bearer",
         "Authorization",
@@ -119,7 +143,7 @@ def assert_guide(text: str, *, linked: bool = False) -> None:
 
 
 def test_guide_explains_bot_chat_access_and_user_consent_without_absolute_security_claims() -> None:
-    text = onboarding_text(PUBLIC_URL)
+    text, keyboard = privacy_presentation()
     assert "Плагин работает только с вашим чатом с ботом" in text
     assert "не входит в Telegram-аккаунт" in text
     assert "не видит остальные переписки, контакты и группы" in text
@@ -127,12 +151,16 @@ def test_guide_explains_bot_chat_access_and_user_consent_without_absolute_securi
     assert "и присылать вам ответы" in text
     assert "Другие пользователи не видят ваши данные" in text
     assert "Передача защищена HTTPS, доступ подтверждаете вы" in text
-    assert "Отключить — /unlink" in text
-    privacy = text.split("🔒 Доступ и приватность\n", 1)[1]
-    bullets = privacy.splitlines()
-    assert len(bullets) == 4
-    assert all(line.startswith("• ") for line in bullets)
-    assert " ".join(line.removeprefix("• ") for line in bullets) == PRIVACY_NOTICE
+    assert "🔗 Отключить" in text
+    assert "/unlink" not in text
+    assert text.split("\n\n", 1)[1] == PRIVACY_NOTICE.replace(
+        "Отключить — /unlink.", "Отключить связь можно кнопкой «🔗 Отключить»."
+    )
+    assert any(
+        button.get("callback_data") == "ui:menu"
+        for row in keyboard["inline_keyboard"]
+        for button in row
+    )
     for claim in ("сквозное шифрование", "end-to-end", "полностью безопас", "не имеет доступа"):
         assert claim not in text
 
@@ -153,7 +181,7 @@ def test_icon_download_uses_public_endpoint_origin(endpoint, icon_url) -> None:
     text = onboarding_text(endpoint, linked=True)
     assert f"URL-адрес сервера: {endpoint}\n" in text
     _, keyboard = onboarding_presentation(text)
-    assert keyboard["inline_keyboard"][-1] == [{"text": "Скачать PNG", "url": icon_url}]
+    assert {"text": "Скачать PNG", "url": icon_url} in keyboard["inline_keyboard"][-1]
     assert "📎 Иконка PNG — файлом ниже." in text
     assert icon_url not in text
     assert text.count(endpoint) == 1
@@ -177,21 +205,17 @@ def copy_buttons(keyboard: dict) -> dict[str, str]:
 def assert_code_placement(text: str, code: str) -> None:
     sections = (
         "Название: Telegram\n",
-        "Описание: Уведомления, ответы и файлы через Telegram-бота.\n",
         "URL-адрес сервера: ",
         "Аутентификация: OAuth\n",
         "🔑 Код подключения\n",
         f"Код входа: {code}\n",
-        "3️⃣ Завершите подключение\n",
+        "Вставьте код в окне подключения.\n",
         "📎 Иконка PNG — файлом ниже.",
-        "Claude\n",
-        "🔒 Доступ и приватность\n",
     )
     offsets = [text.index(section) for section in sections]
     assert offsets == sorted(offsets)
     assert "Аутентификация: OAuth\n\n🔑 Код подключения\n" in text
-    assert f"Код входа: {code}\nБез срока действия. Используется один раз.\n" in text
-    assert "Скопируйте код в окно подключения.\n\n3️⃣ Завершите подключение" in text
+    assert f"Код входа: {code}\nБез срока действия · одноразовый.\n" in text
     assert "10 минут" not in text
 
 
@@ -204,7 +228,6 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
     assert keyboard is not None
     expected = {
         "📋 Название": "Telegram",
-        "📋 Описание": "Уведомления, ответы и файлы через Telegram-бота.",
         "📋 Адрес": endpoint,
         "📋 Код": code,
     }
@@ -213,12 +236,9 @@ def test_presentation_makes_exact_values_copyable_with_utf16_offsets_after_emoji
         expected.values()
     )
     assert [entity_text(text, item) for item in entities if item["type"] == "bold"] == [
-        "1️⃣ Откройте ChatGPT",
-        "2️⃣ Заполните поля",
+        "Подключение к ChatGPT",
+        "Настройки плагина",
         "🔑 Код подключения",
-        "3️⃣ Завершите подключение",
-        "Claude",
-        "🔒 Доступ и приватность",
     ]
     for value in (endpoint, code):
         item = next(item for item in entities if entity_text(text, item) == value)
@@ -292,7 +312,7 @@ def test_presentation_omits_only_address_copy_button_over_256_utf16_units(length
 def test_missing_public_url_has_no_address_copy_or_download_button() -> None:
     _, keyboard = onboarding_presentation(onboarding_text())
     assert keyboard is not None
-    assert set(copy_buttons(keyboard)) == {"📋 Название", "📋 Описание"}
+    assert set(copy_buttons(keyboard)) == {"📋 Название"}
     assert all("url" not in button for row in keyboard["inline_keyboard"] for button in row)
 
 
@@ -314,9 +334,10 @@ def assert_intro(text: str, *, linked: bool) -> None:
     assert "уведомления и сообщения" in text
     assert "читать ваши ответы и файлы" in text
     assert "Модель" not in text
-    assert "/connect" in text
-    assert ("/stop" in text) is linked
-    assert ("/unlink" in text) is linked
+    assert "кнопк" in text or "Подключить" in text
+    assert "/connect" not in text
+    assert "/stop" not in text
+    assert "/unlink" not in text
     assert "https://" not in text
     assert len(text) < 500
 
@@ -373,8 +394,8 @@ async def test_connect_is_available_without_changing_binding_or_optin(setup, act
     assert len(bot.sends) == 1
     response = bot.sends[0]["text"]
     if active is False:
-        assert "/start" in response
-        assert "/connect" in response
+        assert "Включить" in response
+        assert "Подключить" in response
         assert "код входа" in response
         assert "Код входа:" not in response
         assert len(response) < 200
@@ -462,7 +483,7 @@ async def test_connect_preserves_existing_identity_and_profile_metadata(tmp_path
     if active:
         assert "Код входа: synthetic-preserved-code" in bot.sends[-1]["text"]
     else:
-        assert "Сначала отправьте /start" in bot.sends[-1]["text"]
+        assert "Сначала нажмите «🔔 Включить" in bot.sends[-1]["text"]
         assert "Код входа:" not in bot.sends[-1]["text"]
 
 
@@ -490,7 +511,7 @@ async def test_connect_enrollment_failure_is_safe_and_can_be_retried(tmp_path, m
     assert store.list_users() == []
     assert issued == []
     assert_guide(bot.sends[-1]["text"])
-    assert "Не удалось получить код входа. Повторите /connect." in bot.sends[-1]["text"]
+    assert "Не удалось получить код входа. Нажмите «Подключить» ещё раз." in bot.sends[-1]["text"]
     assert "Код входа:" not in bot.sends[-1]["text"]
     assert "synthetic-private-enrollment-error" not in str(bot.sends)
     assert "synthetic-private-enrollment-error" not in caplog.text
@@ -563,7 +584,7 @@ async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(
     service = Service(store, bot, "synthetic_bot", login_code_issuer=issue)
     before = service.find_users()
     await service.handle_update(command("/connect"))
-    assert "Не удалось получить код входа. Повторите /connect." in bot.sends[-1]["text"]
+    assert "Не удалось получить код входа. Нажмите «Подключить» ещё раз." in bot.sends[-1]["text"]
     assert "synthetic-private-error" not in bot.sends[-1]["text"]
     assert "synthetic-private-error" not in caplog.text
     assert "Код входа:" not in bot.sends[-1]["text"]
@@ -571,7 +592,9 @@ async def test_login_code_issuer_failure_is_safe_and_command_can_be_retried(
     await service.handle_update(command("/connect"))
     assert "Код входа: synthetic-retry-code" in bot.sends[-1]["text"]
     await service.handle_update(command("/connect"))
-    assert bot.sends[-1]["text"].endswith("Не удалось получить код входа. Повторите /connect.")
+    assert bot.sends[-1]["text"].endswith(
+        "Не удалось получить код входа. Нажмите «Подключить» ещё раз."
+    )
     assert "synthetic-retry-code" not in bot.sends[-1]["text"]
     assert "Код входа:" not in bot.sends[-1]["text"]
     assert "📋 Код" not in copy_buttons(bot.sends[-1]["reply_markup"])
@@ -588,7 +611,9 @@ async def test_invalid_issued_code_uses_safe_retry_response(tmp_path, code) -> N
     bot = FakeBot()
     service = Service(store, bot, "synthetic_bot", login_code_issuer=lambda user_key: code)
     await service.handle_update(command("/connect"))
-    assert bot.sends[-1]["text"].endswith("Не удалось получить код входа. Повторите /connect.")
+    assert bot.sends[-1]["text"].endswith(
+        "Не удалось получить код входа. Нажмите «Подключить» ещё раз."
+    )
     assert "Код входа:" not in bot.sends[-1]["text"]
 
 
@@ -634,7 +659,7 @@ async def test_unlink_revocation_failure_retains_binding_and_allows_safe_retry(
     before = service.find_users()
     if through_bot:
         await service.handle_update(command("/unlink"))
-        assert bot.sends[-1]["text"] == "Не удалось удалить привязку. Повторите /unlink."
+        assert bot.sends[-1]["text"] == "Не удалось удалить привязку. Попробуйте ещё раз."
         assert bot.command_menus[-1]["commands"] == command_menu(linked=True)
     else:
         with pytest.raises(ServiceError) as caught:
@@ -732,7 +757,13 @@ async def test_unlinked_management_commands_only_point_to_connect_and_do_not_mut
     link = service.create_user_link("synthetic", "Synthetic")
     token = parse_qs(urlsplit(link["link"]).query)["start"][0]
     await service.handle_update(command(text))
-    assert bot.sends == [{"chat_id": 7001, "text": "Для подключения используйте /connect."}]
+    assert bot.sends == [
+        {
+            "chat_id": 7001,
+            "text": "Чтобы подключить AI-чат, нажмите «Подключить».",
+            "reply_markup": menu_keyboard(),
+        }
+    ]
     assert bot.command_menus[-1]["commands"] == command_menu()
     assert service.find_users() == []
     await service.handle_update(command(f"/start {token}"))
@@ -892,3 +923,269 @@ async def test_longest_public_url_and_connect_guide_fit_one_telegram_message(tmp
     assert url in bot.sends[0]["text"]
     assert "Код входа:" in bot.sends[0]["text"]
     assert len(bot.sends[0]["text"].encode("utf-16-le")) // 2 <= 4096
+
+
+async def test_buttons_select_client_before_enrollment_and_issue_only_own_fresh_code(tmp_path):
+    store = Store(tmp_path / "button-enrollment.sqlite3")
+    bot = FakeBot()
+    issued = []
+
+    def issue(user_key):
+        issued.append(user_key)
+        return f"synthetic-code-{len(issued)}"
+
+    service = Service(
+        store, bot, "synthetic_bot", public_mcp_url=PUBLIC_URL, login_code_issuer=issue
+    )
+    assert await service.handle_update(command("/start")) is True
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard()
+    assert await service.handle_update(command(button("ui:connect"))) is True
+    text, markup = client_picker()
+    assert bot.sends[-1] == {"chat_id": 7001, "text": text, "reply_markup": markup}
+    assert store.list_users() == issued == bot.documents == []
+
+    for index, (client, heading) in enumerate(
+        [
+            ("claude", "Подключение к Claude"),
+            ("chatgpt", "Подключение к ChatGPT"),
+            ("other", "Другое AI-приложение"),
+        ],
+        1,
+    ):
+        assert await service.handle_update(callback(f"ui:{client}")) is True
+        user = store.get_user_by_telegram(7001)
+        assert user is not None and user["active"] is True
+        assert issued == [user["user_key"]] * index
+        guide = bot.sends[-1]
+        assert guide["text"].startswith(heading)
+        assert f"Код входа: synthetic-code-{index}\n" in guide["text"]
+        assert copy_buttons(guide["reply_markup"])["📋 Код"] == f"synthetic-code-{index}"
+        assert bot.documents[-1]["reply_markup"] == menu_keyboard(linked=True)
+    assert bot.acknowledgements == ["synthetic-query"] * 3
+    assert len(store.list_users()) == 1
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "ui:menu",
+        "ui:connect",
+        "ui:help",
+        "ui:help_chatgpt",
+        "ui:help_claude",
+        "ui:help_other",
+        "ui:privacy",
+    ],
+)
+async def test_navigation_never_enrolls_issues_codes_or_revokes(tmp_path, action):
+    store = Store(tmp_path / "navigation.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    before = store.list_users()
+
+    def forbidden(user_key):
+        pytest.fail("Navigation must not issue a code or revoke access")
+
+    service = Service(
+        store, bot, "synthetic_bot", login_code_issuer=forbidden, user_unlinked=forbidden
+    )
+    assert await service.handle_update(callback(action)) is True
+    assert store.list_users() == before
+    assert len(bot.sends) == 1
+    assert bot.documents == []
+    assert bot.acknowledgements == ["synthetic-query"]
+    if action == "ui:help":
+        assert bot.sends[-1]["text"] == help_presentation()[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"id": None},
+        {"id": True},
+        {"id": ""},
+        {"id": "x" * 257},
+        {"id": "synthetic query"},
+        {"id": "synthetic\nquery"},
+        {"id": "🙂"},
+        {"data": "ui:chatgpt:7002"},
+        {"data": "ui:chatgpt "},
+        {"data": {}},
+        {"inline_message_id": "synthetic-inline"},
+        {"from": {"id": 7002, "is_bot": False}},
+        {"from": {"id": 7001, "is_bot": True}},
+        {"from": {"id": True, "is_bot": False}},
+        {"from": {"id": 7001, "is_bot": False, "first_name": "bad\x00name"}},
+        {"from": {"id": 7001, "is_bot": False, "username": {}}},
+        {"message": None},
+    ],
+)
+async def test_untrusted_callback_queries_never_acknowledge_or_act(tmp_path, mutation):
+    store = Store(tmp_path / "unsafe-callback.sqlite3")
+    bot = FakeBot()
+
+    def forbidden(user_key):
+        pytest.fail("Untrusted callbacks must not issue codes")
+
+    service = Service(store, bot, "synthetic_bot", login_code_issuer=forbidden)
+    update = callback("ui:chatgpt")
+    update["callback_query"].update(copy.deepcopy(mutation))
+    assert await service.handle_update(update) is False
+    assert store.list_users() == bot.sends == bot.documents == bot.acknowledgements == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"chat": {"type": "group", "id": -100123}},
+        {"chat": {"type": "supergroup", "id": -100123}},
+        {"chat": {"type": "private", "id": 7002}},
+        {"chat": {"type": "private", "id": True}},
+        {"from": {"id": 9999, "is_bot": False, "username": "synthetic_bot"}},
+        {"from": {"id": 9999, "is_bot": True, "username": "foreign_bot"}},
+        {"from": {"id": True, "is_bot": True, "username": "synthetic_bot"}},
+        {"from": {"id": 9999, "is_bot": True}},
+        {"message_id": True},
+        {"message_id": 0},
+        {"date": 0},
+        {"date": True},
+        {"forward_origin": {}},
+        {"forward_from": {}},
+        {"via_bot": {}},
+        {"sender_chat": {}},
+        {"edit_date": 1},
+        {"business_connection_id": "synthetic"},
+    ],
+)
+async def test_callbacks_require_accessible_own_bot_message_in_senders_private_chat(
+    setup, mutation
+):
+    service, store, bot = setup
+    update = callback("ui:chatgpt")
+    update["callback_query"]["message"].update(copy.deepcopy(mutation))
+    assert await service.handle_update(update) is False
+    assert store.list_users() == bot.sends == bot.documents == bot.acknowledgements == []
+
+
+@pytest.mark.parametrize("label", list(BUTTON_ACTIONS))
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"forward_origin": {}},
+        {"chat": {"type": "group", "id": -100123}},
+        {"from": {"id": 7001, "is_bot": False, "username": []}},
+    ],
+)
+async def test_every_reply_keyboard_alias_uses_private_and_safe_author_gates(
+    setup, label, mutation
+):
+    service, store, bot = setup
+    update = command(label)
+    update["message"].update(copy.deepcopy(mutation))
+    assert await service.handle_update(update) is False
+    assert store.list_users() == bot.sends == bot.command_menus == []
+
+
+@pytest.mark.parametrize("failure", [TelegramAPIError(400), TelegramTransportError()])
+async def test_callback_acknowledgement_failure_is_sanitized_and_never_retried(
+    setup, caplog, failure
+):
+    service, _, bot = setup
+
+    async def fail(query_id):
+        bot.acknowledgements.append(query_id)
+        raise failure
+
+    bot.answer_callback_query = fail
+    assert await service.handle_update(callback("ui:menu", query_id="!" * 256)) is True
+    assert bot.acknowledgements == ["!" * 256]
+    assert len(bot.sends) == 1
+    assert caplog.records[-1].message == "Telegram callback acknowledgement could not be sent."
+
+
+async def test_button_optout_requires_explicit_start_before_selected_client_issues_code(tmp_path):
+    store = Store(tmp_path / "button-optin.sqlite3")
+    bind(store)
+    bot = FakeBot()
+    issued = []
+    service = Service(
+        store,
+        bot,
+        "synthetic_bot",
+        login_code_issuer=lambda key: issued.append(key) or "synthetic-code",
+    )
+    assert await service.handle_update(command(button("ui:stop"))) is True
+    assert store.get_user("synthetic")["active"] is False
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True, active=False)
+    assert await service.handle_update(callback("ui:claude")) is True
+    assert issued == []
+    assert "Код входа:" not in bot.sends[-1]["text"]
+    assert store.get_user("synthetic")["active"] is False
+    assert await service.handle_update(command(button("ui:start"))) is True
+    assert store.get_user("synthetic")["active"] is True
+    assert await service.handle_update(callback("ui:claude")) is True
+    assert issued == ["synthetic"]
+
+
+async def test_unlink_confirmation_only_revokes_current_senders_binding_once(setup):
+    _, store, bot = setup
+    bind(store)
+    another = store.create_link("another", "Another")
+    store.consume_link(another["token"], 7002, 7002, None, "Another")
+    revoked = []
+    service = Service(store, bot, "synthetic_bot", user_unlinked=revoked.append)
+    assert await service.handle_update(callback("ui:unlink_confirm")) is True
+    assert store.get_user("synthetic") is not None
+    assert await service.handle_update(command(button("ui:unlink"))) is True
+    assert store.get_user("synthetic") is not None and revoked == []
+    assert await service.handle_update(callback("ui:unlink_confirm", telegram_id=7002)) is True
+    assert store.get_user("another") is not None and revoked == []
+    assert await service.handle_update(callback("ui:unlink_confirm")) is True
+    assert store.get_user("synthetic") is None
+    assert revoked == ["synthetic"]
+    assert await service.handle_update(callback("ui:unlink_confirm")) is True
+    assert revoked == ["synthetic"]
+    assert store.get_user("another") is not None
+
+
+@pytest.mark.parametrize("invalidator", ["menu", "expired", "replacement"])
+async def test_unlink_confirmation_cancels_expires_and_cannot_revoke_replacement(
+    setup, monkeypatch, invalidator
+):
+    service, store, _ = setup
+    bind(store)
+    monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 100.0)
+    await service.handle_update(callback("ui:unlink"))
+    if invalidator == "menu":
+        await service.handle_update(callback("ui:menu"))
+    elif invalidator == "expired":
+        monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 221.0)
+    else:
+        store.delete_user("synthetic")
+        new = store.create_link("replacement", "Replacement")
+        store.consume_link(new["token"], 7001, 7001, None, "Replacement")
+    await service.handle_update(callback("ui:unlink_confirm"))
+    assert store.get_user_by_telegram(7001) is not None
+
+
+async def test_unlink_confirmation_memory_is_bounded(setup, monkeypatch):
+    service, store, _ = setup
+    bind(store)
+    monkeypatch.setattr("telegram_ping_mcp.service.monotonic", lambda: 100.0)
+    service._pending_unlinks = {key: ("synthetic-other", 200.0) for key in range(1, 1001)}
+    await service.handle_update(callback("ui:unlink"))
+    assert len(service._pending_unlinks) == 1000
+    assert 1 not in service._pending_unlinks
+    assert 7001 in service._pending_unlinks
+
+
+async def test_unrecognized_updates_return_false_for_inbox_routing(setup):
+    service, _, bot = setup
+    for update in [
+        None,
+        {},
+        command("Synthetic ordinary message"),
+        {"edited_message": command("/start")["message"]},
+    ]:
+        assert await service.handle_update(update) is False
+    assert bot.sends == []

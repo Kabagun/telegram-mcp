@@ -8,6 +8,7 @@ from importlib import resources
 import httpx
 import pytest
 
+from telegram_ping_mcp.onboarding import BUTTON_ACTIONS, CALLBACK_ACTIONS
 from telegram_ping_mcp.telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 TOKEN = "123456:synthetic-test-token"
@@ -76,6 +77,54 @@ async def test_connector_icon_uploads_exact_packaged_png_with_fixed_fields(base_
         "write": 10.0,
         "pool": 10.0,
     }
+
+
+async def test_connector_icon_serializes_persistent_keyboard_in_multipart_field():
+    calls = []
+    markup = {
+        "keyboard": [[{"text": label}] for label in list(BUTTON_ACTIONS)[:4]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+    def api(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": acknowledgement()})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+        assert (
+            await TelegramClient(TOKEN, client=client).send_connector_icon(
+                CHAT_ID, reply_markup=markup
+            )
+            == acknowledgement()
+        )
+    assert len(calls) == 1
+    parts = multipart_parts(calls[0])
+    assert [part.get_param("name", header="content-disposition") for part in parts] == [
+        "chat_id",
+        "caption",
+        "reply_markup",
+        "document",
+    ]
+    assert json.loads(parts[2].get_payload(decode=True)) == markup
+    assert parts[3].get_filename() == "telegram-icon.png"
+
+
+async def test_connector_icon_invalid_keyboard_fails_before_resource_access(monkeypatch):
+    def forbidden(*_):
+        pytest.fail("Invalid keyboards must fail before resource access or HTTP")
+
+    monkeypatch.setattr("telegram_ping_mcp.telegram.resources.files", forbidden)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden)) as client:
+        with pytest.raises(ValueError, match="Telegram reply markup is invalid"):
+            await TelegramClient(TOKEN, client=client).send_connector_icon(
+                CHAT_ID,
+                reply_markup={
+                    "keyboard": [[{"text": "Synthetic"}]],
+                    "resize_keyboard": True,
+                    "is_persistent": True,
+                },
+            )
 
 
 @pytest.mark.parametrize("chat_id", [None, 0, -1, True, "7001", 7001.0, 2**63])
@@ -281,6 +330,94 @@ async def test_message_preserves_copy_and_https_buttons_without_parse_mode_or_re
     }
 
 
+@pytest.mark.parametrize("action", sorted(CALLBACK_ACTIONS))
+async def test_message_preserves_each_static_callback_action(action):
+    calls = []
+    markup = {"inline_keyboard": [[{"text": "Synthetic navigation", "callback_data": action}]]}
+
+    def api(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": acknowledgement()})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+        await TelegramClient(TOKEN, client=client).send_message(
+            CHAT_ID, "Guide", reply_markup=markup
+        )
+    assert json.loads(calls[0].content)["reply_markup"] == markup
+
+
+@pytest.mark.parametrize("label", sorted(BUTTON_ACTIONS))
+async def test_message_preserves_each_static_reply_keyboard_label(label):
+    calls = []
+    markup = {
+        "keyboard": [[{"text": label}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+    def api(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": acknowledgement()})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+        await TelegramClient(TOKEN, client=client).send_message(
+            CHAT_ID, "Guide", reply_markup=markup
+        )
+    assert json.loads(calls[0].content)["reply_markup"] == markup
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        {"keyboard": [[{"text": label}]], "resize_keyboard": True}
+        for label in list(BUTTON_ACTIONS)[:1]
+    ]
+    + [
+        {"keyboard": keyboard, "resize_keyboard": resize, "is_persistent": persistent, **extra}
+        for keyboard, resize, persistent, extra in [
+            ([], True, True, {}),
+            ([[]], True, True, {}),
+            (([{"text": next(iter(BUTTON_ACTIONS))}],), True, True, {}),
+            ([[next(iter(BUTTON_ACTIONS))]], True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]] * 5, True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}] * 4], True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], False, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, False, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], 1, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, 1, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"one_time_keyboard": True}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"inline_keyboard": []}),
+            ([[{"text": "Synthetic"}]], True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS)), "request_contact": True}]], True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS)), "request_location": True}]], True, True, {}),
+            ([[{"text": next(iter(BUTTON_ACTIONS)), "callback_data": "ui:menu"}]], True, True, {}),
+            (
+                [
+                    [
+                        {
+                            "text": next(iter(BUTTON_ACTIONS)),
+                            "web_app": {"url": "https://example.invalid/"},
+                        }
+                    ]
+                ],
+                True,
+                True,
+                {},
+            ),
+        ]
+    ],
+)
+async def test_non_static_or_malformed_reply_keyboard_fails_before_network(markup):
+    def forbidden(request):
+        pytest.fail("Invalid keyboards must not reach Telegram")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden)) as client:
+        with pytest.raises(ValueError, match="Telegram reply markup is invalid"):
+            await TelegramClient(TOKEN, client=client).send_message(
+                CHAT_ID, "Guide", reply_markup=markup
+            )
+
+
 async def test_keyboard_accepts_row_button_and_utf16_length_boundaries():
     markup = {
         "inline_keyboard": [
@@ -367,6 +504,11 @@ async def test_invalid_keyboard_shapes_fail_before_network(markup):
         {"text": "Synthetic", "copy_text": {"text": "Copy", "url": "https://example.invalid/"}},
         {"text": "Synthetic", "copy_text": {"text": "Copy"}, "url": "https://example.invalid/"},
         {"text": "Synthetic", "callback_data": "synthetic"},
+        {"text": "Synthetic", "callback_data": None},
+        {"text": "Synthetic", "callback_data": []},
+        {"text": "Synthetic", "callback_data": "ui:menu:synthetic"},
+        {"text": "Synthetic", "callback_data": "ui:menu", "url": "https://example.invalid/"},
+        {"text": "Synthetic", "callback_data": "ui:menu", "copy_text": {"text": "Copy"}},
         {"text": "Synthetic", "web_app": {"url": "https://example.invalid/"}},
         {"text": "Synthetic", "login_url": {"url": "https://example.invalid/"}},
         {"text": "Synthetic", "pay": True},

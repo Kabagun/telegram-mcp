@@ -391,7 +391,8 @@ async def test_link_commands_optout_resubscribe_and_unlink_are_safe_and_idempote
 ) -> None:
     await service.handle_update(command("/start"))
     assert bot.sends[-1]["text"].startswith("AI Connector")
-    assert "/connect" in bot.sends[-1]["text"]
+    assert "Подключить" in bot.sends[-1]["text"]
+    assert bot.sends[-1]["reply_markup"]["is_persistent"] is True
     assert "ссылку-приглашение" not in bot.sends[-1]["text"]
     token = token_from(service.create_user_link("synthetic", "Synthetic"))
     await service.handle_update(command(f"/start@SYNTHETIC_BOT {token}"))

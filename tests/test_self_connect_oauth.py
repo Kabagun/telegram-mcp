@@ -21,6 +21,8 @@ VERIFIER = "S" * 43
 class SyntheticBot:
     def __init__(self):
         self.messages = []
+        self.icons = []
+        self.callback_answers = []
 
     async def get_me(self):
         return {"username": "synthetic_bot"}
@@ -32,7 +34,12 @@ class SyntheticBot:
         self.messages.append({"chat_id": chat_id, "text": text, **options})
         return {"message_id": len(self.messages), "chat": {"id": chat_id}}
 
-    async def send_connector_icon(self, chat_id):
+    async def send_connector_icon(self, chat_id, *, reply_markup=None):
+        self.icons.append({"chat_id": chat_id, "reply_markup": reply_markup})
+        return None
+
+    async def answer_callback_query(self, query_id, text=None):
+        self.callback_answers.append(query_id)
         return None
 
     async def aclose(self):
@@ -175,3 +182,61 @@ async def test_first_connect_code_completes_oauth_and_stays_scoped_after_reenrol
         assert new_user["user_key"] != user["user_key"]
         assert "Код входа: " in bot.messages[-1]["text"]
         assert await runtime.oauth.load_access_token(access_token) is None
+
+
+async def test_button_runtime_keeps_controls_out_of_the_inbox(tmp_path):
+    config = Config(
+        bot_token="123:synthetic-token",
+        auth_token="synthetic-operator-token-for-ui-test-123456",
+        database_path=tmp_path / "ui.sqlite3",
+        polling_enabled=False,
+        allowed_hosts=("connector.example.test",),
+        public_mcp_url=RESOURCE,
+    )
+    bot = SyntheticBot()
+    runtime = Runtime(config, bot=bot)
+    app = create_http_app(runtime)
+
+    def incoming(text, message_id):
+        value = command(text)
+        value["message"].update(message_id=message_id, date=1000)
+        return value
+
+    def callback(action, query_id):
+        return {
+            "callback_query": {
+                "id": query_id,
+                "data": action,
+                "from": {"id": 7001, "is_bot": False, "first_name": "Synthetic"},
+                "message": {
+                    "message_id": 1,
+                    "date": 1000,
+                    "chat": {"id": 7001, "type": "private"},
+                    "from": {"id": 123, "is_bot": True, "username": "synthetic_bot"},
+                },
+            }
+        }
+
+    async with app.router.lifespan_context(app):
+        await runtime.handle_update(incoming("/start", 1))
+        assert bot.messages[-1]["reply_markup"]["is_persistent"] is True
+        await runtime.handle_update(incoming("🔌 Подключить", 2))
+        assert "Куда подключаем" in bot.messages[-1]["text"]
+        assert runtime.service.find_users() == []
+        await runtime.handle_update(callback("ui:claude", "synthetic-choose"))
+        assert bot.callback_answers == ["synthetic-choose"]
+        assert bot.messages[-1]["text"].startswith("Подключение к Claude")
+        assert "Код входа:" in bot.messages[-1]["text"]
+        assert bot.icons[-1]["reply_markup"]["is_persistent"] is True
+        assert runtime.inbox.list_messages() == []
+        await runtime.handle_update(incoming("Synthetic actual inbox text", 3))
+        assert len(runtime.inbox.list_messages()) == 1
+        await runtime.handle_update(incoming("⏸ Пауза", 4))
+        assert runtime.service.store.get_user_by_telegram(7001)["active"] is False
+        await runtime.handle_update(incoming("🔔 Включить", 5))
+        assert runtime.service.store.get_user_by_telegram(7001)["active"] is True
+        await runtime.handle_update(incoming("🔗 Отключить", 6))
+        assert runtime.service.store.get_user_by_telegram(7001) is not None
+        await runtime.handle_update(callback("ui:unlink_confirm", "synthetic-confirm"))
+        assert runtime.service.store.get_user_by_telegram(7001) is None
+        assert len(runtime.inbox.list_messages()) == 1

@@ -9,9 +9,22 @@ import logging
 import re
 import unicodedata
 from collections.abc import Callable, Sequence
+from time import monotonic
 from typing import Any
 
-from .onboarding import command_menu, intro_text, onboarding_presentation, onboarding_text
+from .onboarding import (
+    BUTTON_ACTIONS,
+    CALLBACK_ACTIONS,
+    client_picker,
+    command_menu,
+    help_presentation,
+    intro_text,
+    menu_keyboard,
+    onboarding_presentation,
+    onboarding_text,
+    privacy_presentation,
+    unlink_presentation,
+)
 from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
@@ -26,18 +39,18 @@ _INACTIVE = "The user has not enabled notifications."
 _INVALID_LINK = "Ссылка недействительна или устарела. Запросите новое приглашение."
 _LINKED = "Связь подтверждена. Уведомления включены."
 _STARTED = "Уведомления включены."
-_STOPPED = "Уведомления отключены. Чтобы включить их снова, отправьте /start."
-_UNLINKED = "Связь с вашим аккаунтом удалена. Для подключения потребуется новое приглашение."
-_UNLINK_RETRY = "Не удалось удалить привязку. Повторите /unlink."
-_CONNECT = "Для подключения используйте /connect."
+_STOPPED = "Уведомления отключены. Чтобы включить их снова, нажмите «🔔 Включить»."
+_UNLINKED = "Связь с вашим аккаунтом удалена. Подключиться заново можно кнопкой «🔌 Подключить»."
+_UNLINK_RETRY = "Не удалось удалить привязку. Попробуйте ещё раз."
+_CONNECT = "Чтобы подключить AI-чат, нажмите «Подключить»."
 _CONNECT_STOPPED = (
-    "Сначала отправьте /start, чтобы включить подключение. "
-    "Затем /connect — получите код входа для AI-чата."
+    "Сначала нажмите «🔔 Включить». Затем нажмите «🔌 Подключить», "
+    "чтобы получить код входа для AI-чата."
 )
-_CONNECT_RETRY = "Не удалось получить код входа. Повторите /connect."
+_CONNECT_RETRY = "Не удалось получить код входа. Нажмите «Подключить» ещё раз."
 _CONNECT_ICON_NOTE = "📎 Иконка PNG — файлом ниже."
 _CONNECT_ICON_RETRY = (
-    "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите /connect."
+    "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите подключение."
 )
 logger = logging.getLogger(__name__)
 _FORWARDED_FIELDS = {
@@ -123,10 +136,10 @@ class Service:
         self._link_ttl_seconds = link_ttl_seconds
         self._allowed_group_chat_ids = allowed_group_chat_ids
         self._public_mcp_url = public_mcp_url
-        self._onboarding_text = onboarding_text(public_mcp_url)
-        self._linked_onboarding_text = onboarding_text(public_mcp_url, linked=True)
+        onboarding_text(public_mcp_url)
         self._login_code_issuer = login_code_issuer
         self._user_unlinked = user_unlinked
+        self._pending_unlinks: dict[int, tuple[str, float]] = {}
 
     @property
     def store(self) -> Store:
@@ -385,13 +398,80 @@ class Service:
         except (TelegramAPIError, TelegramTransportError):
             logger.warning("Telegram chat command menu could not be updated.")
 
-    def _connect_text(self, telegram_id: int) -> str:
+    def _keyboard(self, telegram_id: int) -> dict[str, Any]:
+        user = self._store.get_user_by_telegram(telegram_id)
+        return menu_keyboard(linked=user is not None, active=user is None or user["active"] is True)
+
+    @staticmethod
+    def _private_author(message: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+        if any(field in message for field in _FORWARDED_FIELDS):
+            return None
+        chat = message.get("chat")
+        author = message.get("from")
+        if not isinstance(chat, dict) or not isinstance(author, dict):
+            return None
+        if chat.get("type") != "private" or author.get("is_bot") is not False:
+            return None
+        try:
+            telegram_id = _integer(author.get("id"))
+            if _integer(chat.get("id")) != telegram_id:
+                return None
+            Service._author_profile(author)
+        except ServiceError:
+            return None
+        return telegram_id, author
+
+    @staticmethod
+    def _author_profile(author: dict[str, Any]) -> tuple[str | None, str]:
+        username = author.get("username")
+        if username is not None:
+            username = _safe_text(username, maximum=128, allow_blank=True)
+        first_name = _safe_text(author.get("first_name", ""), maximum=128, allow_blank=True)
+        return username, first_name
+
+    def _callback_control(self, query: object) -> tuple[str, int, dict[str, Any], str] | None:
+        if not isinstance(query, dict) or "inline_message_id" in query:
+            return None
+        query_id = query.get("id")
+        action = query.get("data")
+        if (
+            not isinstance(query_id, str)
+            or not 1 <= len(query_id) <= 256
+            or any(not "!" <= character <= "~" for character in query_id)
+            or not isinstance(action, str)
+            or action not in CALLBACK_ACTIONS
+        ):
+            return None
+        message = query.get("message")
+        if not isinstance(message, dict) or any(field in message for field in _FORWARDED_FIELDS):
+            return None
+        bot_author = message.get("from")
+        if (
+            not isinstance(bot_author, dict)
+            or bot_author.get("is_bot") is not True
+            or not isinstance(bot_author.get("username"), str)
+            or bot_author["username"].casefold() != self._bot_username.casefold()
+        ):
+            return None
+        try:
+            _integer(bot_author.get("id"))
+            _integer(message.get("message_id"))
+            _integer(message.get("date"))
+        except ServiceError:
+            return None
+        private = self._private_author({"chat": message.get("chat"), "from": query.get("from")})
+        if private is None:
+            return None
+        telegram_id, author = private
+        return action, telegram_id, author, query_id
+
+    def _connect_text(self, telegram_id: int, *, client: str = "chatgpt") -> str:
         user = self._store.get_user_by_telegram(telegram_id)
         if user is None:
-            return self._onboarding_text
+            return onboarding_text(self._public_mcp_url, client=client)
         if user.get("active") is not True:
             return _CONNECT_STOPPED
-        response = self._linked_onboarding_text
+        response = onboarding_text(self._public_mcp_url, linked=True, client=client)
         if self._login_code_issuer is None:
             return response
         try:
@@ -402,88 +482,103 @@ class Service:
                 return _CONNECT_STOPPED
             code = _safe_text(self._login_code_issuer(binding["user_key"]), maximum=128)
             return _message_text(
-                onboarding_text(self._public_mcp_url, linked=True, login_code=code)
+                onboarding_text(self._public_mcp_url, linked=True, login_code=code, client=client)
             )
         except Exception:
             return f"{response}\n\n{_CONNECT_RETRY}"
 
-    async def handle_update(self, update: dict[str, Any]) -> None:
-        if not isinstance(update, dict) or not isinstance(update.get("message"), dict):
-            return
-        message = update["message"]
-        if any(field in message for field in _FORWARDED_FIELDS):
-            return
-        chat = message.get("chat")
-        author = message.get("from")
-        if not isinstance(chat, dict) or not isinstance(author, dict):
-            return
-        if chat.get("type") != "private" or author.get("is_bot") is not False:
-            return
-        try:
-            telegram_id = _integer(author.get("id"))
-            if _integer(chat.get("id")) != telegram_id:
-                return
-        except ServiceError:
-            return
-        text = message.get("text")
-        if not isinstance(text, str):
-            return
-        command = _COMMAND.fullmatch(text)
-        if command is None:
-            return
-        name, username, token = command.groups()
-        if username is not None and username.casefold() != self._bot_username.casefold():
-            return
-        if token is not None and name != "start":
-            return
-        if name == "connect":
-            if self._login_code_issuer is not None:
-                try:
-                    author_username = author.get("username")
-                    if author_username is not None:
-                        author_username = _safe_text(author_username, maximum=128, allow_blank=True)
-                    first_name = _safe_text(
-                        author.get("first_name", ""), maximum=128, allow_blank=True
-                    )
-                except ServiceError:
-                    return
-                try:
-                    self._store.ensure_private_user(
-                        telegram_id, telegram_id, author_username, first_name
-                    )
-                except Exception:
-                    response = f"{self._onboarding_text}\n\n{_CONNECT_RETRY}"
-                else:
-                    response = self._connect_text(telegram_id)
+    async def _send_connect(self, telegram_id: int, author: dict[str, Any], *, client: str) -> None:
+        if self._login_code_issuer is not None:
+            username, first_name = self._author_profile(author)
+            try:
+                self._store.ensure_private_user(telegram_id, telegram_id, username, first_name)
+            except Exception:
+                response = (
+                    f"{onboarding_text(self._public_mcp_url, client=client)}\n\n{_CONNECT_RETRY}"
+                )
             else:
-                response = self._connect_text(telegram_id)
-            if _CONNECT_ICON_NOTE not in response:
-                response = f"{response}\n\n{_CONNECT_ICON_NOTE}"
-            response = _message_text(response)
-            entities, reply_markup = onboarding_presentation(response)
-            sent = await self._reply(
-                telegram_id,
-                response,
-                entities=entities,
-                reply_markup=reply_markup,
-                deactivate_on_forbidden=False,
+                response = self._connect_text(telegram_id, client=client)
+        else:
+            response = self._connect_text(telegram_id, client=client)
+        if _CONNECT_ICON_NOTE not in response:
+            response = f"{response}\n\n{_CONNECT_ICON_NOTE}"
+        response = _message_text(response)
+        entities, reply_markup = onboarding_presentation(response)
+        sent = await self._reply(
+            telegram_id,
+            response,
+            entities=entities,
+            reply_markup=reply_markup,
+            deactivate_on_forbidden=False,
+        )
+        if sent:
+            try:
+                await self._bot.send_connector_icon(
+                    telegram_id, reply_markup=self._keyboard(telegram_id)
+                )
+            except (TelegramAPIError, TelegramTransportError, OSError, ValueError):
+                await self._reply(
+                    telegram_id,
+                    _CONNECT_ICON_RETRY,
+                    reply_markup=self._keyboard(telegram_id),
+                    deactivate_on_forbidden=False,
+                )
+        await self._refresh_commands(telegram_id)
+
+    async def _control(
+        self,
+        action: str,
+        telegram_id: int,
+        author: dict[str, Any],
+        *,
+        token: str | None = None,
+        legacy: bool = False,
+    ) -> None:
+        now = monotonic()
+        self._pending_unlinks = {
+            key: pending for key, pending in self._pending_unlinks.items() if pending[1] > now
+        }
+        pending = self._pending_unlinks.pop(telegram_id, None)
+        user = self._store.get_user_by_telegram(telegram_id)
+        confirming_unlink = (
+            action == "ui:unlink_confirm"
+            and pending is not None
+            and user is not None
+            and pending[0] == user["user_key"]
+        )
+        if action in {"ui:chatgpt", "ui:claude", "ui:other"} or (legacy and action == "ui:connect"):
+            await self._send_connect(
+                telegram_id, author, client=action.removeprefix("ui:") if not legacy else "chatgpt"
             )
-            if sent:
-                try:
-                    await self._bot.send_connector_icon(telegram_id)
-                except (TelegramAPIError, TelegramTransportError, OSError, ValueError):
-                    await self._reply(
-                        telegram_id, _CONNECT_ICON_RETRY, deactivate_on_forbidden=False
-                    )
-            await self._refresh_commands(telegram_id)
             return
+        if action == "ui:connect":
+            response, markup = client_picker()
+        elif action in {"ui:help", "ui:help_chatgpt", "ui:help_claude", "ui:help_other"}:
+            response, markup = help_presentation(
+                action.removeprefix("ui:help_") if action != "ui:help" else None
+            )
+        elif action == "ui:privacy":
+            response, markup = privacy_presentation()
+        elif action == "ui:unlink" and not legacy:
+            if user is not None:
+                if len(self._pending_unlinks) >= 1000:
+                    del self._pending_unlinks[next(iter(self._pending_unlinks))]
+                self._pending_unlinks[telegram_id] = (user["user_key"], now + 120)
+            response, markup = unlink_presentation()
+        elif action == "ui:menu" or (action == "ui:unlink_confirm" and not confirming_unlink):
+            response = intro_text(linked=self._store.get_user_by_telegram(telegram_id) is not None)
+            markup = self._keyboard(telegram_id)
+        else:
+            await self._management_control(action, telegram_id, author, token=token)
+            return
+        await self._reply(telegram_id, response, reply_markup=markup)
+
+    async def _management_control(
+        self, action: str, telegram_id: int, author: dict[str, Any], *, token: str | None
+    ) -> None:
+        name = action.removeprefix("ui:")
         if name == "start" and token is not None:
-            username = author.get("username")
-            first_name = author.get("first_name", "")
-            if (username is not None and not isinstance(username, str)) or not isinstance(
-                first_name, str
-            ):
-                return
+            username, first_name = self._author_profile(author)
             try:
                 self._store.consume_link(token, telegram_id, telegram_id, username, first_name)
             except ValueError:
@@ -516,5 +611,45 @@ class Service:
                 linked=self._store.get_user_by_telegram(telegram_id) is not None
             )
             response = f"{response}\n\n{introduction}" if response else introduction
-        await self._reply(telegram_id, response)
+        await self._reply(telegram_id, response, reply_markup=self._keyboard(telegram_id))
         await self._refresh_commands(telegram_id)
+
+    async def handle_update(self, update: dict[str, Any]) -> bool:
+        """Return whether an authenticated bot control was handled, excluding inbox text."""
+        if not isinstance(update, dict):
+            return False
+        if "callback_query" in update:
+            control = self._callback_control(update["callback_query"])
+            if control is None:
+                return False
+            action, telegram_id, author, query_id = control
+            try:
+                await self._bot.answer_callback_query(query_id)
+            except (TelegramAPIError, TelegramTransportError):
+                logger.warning("Telegram callback acknowledgement could not be sent.")
+            await self._control(action, telegram_id, author)
+            return True
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return False
+        private = self._private_author(message)
+        if private is None:
+            return False
+        telegram_id, author = private
+        text = message.get("text")
+        if not isinstance(text, str):
+            return False
+        action = BUTTON_ACTIONS.get(text)
+        if action is not None:
+            await self._control(action, telegram_id, author)
+            return True
+        command = _COMMAND.fullmatch(text)
+        if command is None:
+            return False
+        name, username, token = command.groups()
+        if username is not None and username.casefold() != self._bot_username.casefold():
+            return False
+        if token is not None and name != "start":
+            return False
+        await self._control(f"ui:{name}", telegram_id, author, token=token, legacy=True)
+        return True

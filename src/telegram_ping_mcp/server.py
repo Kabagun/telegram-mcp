@@ -213,8 +213,9 @@ class Runtime:
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         if self.service is not None and self.inbound is not None:
-            await self.service.handle_update(update)
-            await self.inbound.handle_update(update)
+            handled = await self.service.handle_update(update)
+            if handled is not True:
+                await self.inbound.handle_update(update)
 
     def require_inbox(self) -> InboxStore:
         self.require_service()

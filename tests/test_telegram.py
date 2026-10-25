@@ -88,10 +88,125 @@ async def test_get_updates_requests_selected_types_and_long_read_timeout():
     assert json.loads(calls[0].content) == {
         "offset": 19,
         "timeout": 25,
-        "allowed_updates": ["message", "my_chat_member"],
+        "allowed_updates": ["message", "callback_query"],
     }
     assert calls[0].extensions["timeout"]["read"] == 35
     assert calls[1].extensions["timeout"]["read"] == 20
+
+
+@pytest.mark.parametrize(
+    "callback_query_id,text",
+    [("synthetic-callback", None), ("_" * 256, ""), ("synthetic:callback", "🙂" * 100)],
+)
+async def test_callback_query_answer_uses_one_post_with_optional_bounded_text(
+    callback_query_id, text
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    bot, http_client = make_client(handler)
+    async with http_client:
+        assert await bot.answer_callback_query(callback_query_id, text) is None
+    assert len(calls) == 1
+    assert calls[0].method == "POST"
+    assert calls[0].url == f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
+    expected = {"callback_query_id": callback_query_id}
+    if text is not None:
+        expected["text"] = text
+    assert json.loads(calls[0].content) == expected
+
+
+@pytest.mark.parametrize(
+    "callback_query_id",
+    [None, 1, True, [], "", "x" * 257, "x y", "x\ny", "x\ty", "x\x00", "x\x7f", "é"],
+)
+async def test_invalid_callback_query_identifier_never_creates_request(callback_query_id):
+    def forbidden(request):
+        pytest.fail("Invalid callback identifiers must not reach Telegram")
+
+    bot, http_client = make_client(forbidden)
+    async with http_client:
+        with pytest.raises(ValueError, match="callback query identifier is invalid"):
+            await bot.answer_callback_query(callback_query_id)
+
+
+@pytest.mark.parametrize(
+    "text", [1, True, [], {}, "x" * 201, "🙂" * 101, "x\n", "x\t", "x\x00", "x\u202e", "x\ud800"]
+)
+async def test_invalid_callback_query_text_never_creates_request(text):
+    def forbidden(request):
+        pytest.fail("Invalid callback text must not reach Telegram")
+
+    bot, http_client = make_client(forbidden)
+    async with http_client:
+        with pytest.raises(ValueError, match="callback query text is invalid"):
+            await bot.answer_callback_query("synthetic-callback", text)
+
+
+@pytest.mark.parametrize("result", [False, 0, 1, None, {}, []])
+async def test_callback_query_answer_requires_true_acknowledgement_without_retry(result):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    bot, http_client = make_client(handler)
+    async with http_client:
+        with pytest.raises(TelegramAPIError) as caught:
+            await bot.answer_callback_query("synthetic-callback")
+    assert caught.value.code == 502
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ConnectError])
+async def test_callback_query_transport_error_is_sanitized_without_retry(error_type):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise error_type(f"{request.url} {PRIVATE_TEXT}", request=request)
+
+    bot, http_client = make_client(handler)
+    async with http_client:
+        with pytest.raises(TelegramTransportError) as caught:
+            await bot.answer_callback_query("synthetic-callback", PRIVATE_TEXT)
+    assert len(calls) == 1
+    assert caught.value.__context__ is None
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert TOKEN not in rendered
+    assert PRIVATE_TEXT not in rendered
+    assert "api.telegram.org" not in rendered
+
+
+@pytest.mark.parametrize("code", [400, 429, 500])
+async def test_callback_query_api_rejection_is_sanitized_without_retry(code):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            code,
+            json={
+                "ok": False,
+                "error_code": code,
+                "description": f"{TOKEN} {PRIVATE_TEXT}",
+                "parameters": {"retry_after": 12},
+            },
+        )
+
+    bot, http_client = make_client(handler)
+    async with http_client:
+        with pytest.raises(TelegramAPIError) as caught:
+            await bot.answer_callback_query("synthetic-callback")
+    assert caught.value.code == code
+    assert caught.value.retry_after == 12
+    assert len(calls) == 1
+    assert TOKEN not in str(caught.value)
+    assert PRIVATE_TEXT not in str(caught.value)
 
 
 @pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ConnectError])
