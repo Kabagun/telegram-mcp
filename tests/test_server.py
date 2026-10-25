@@ -193,7 +193,7 @@ async def test_real_sdk_http_end_to_end_auth_link_send_dedup_optout_group(config
                         assert entity["user"]["id"] == 7001
                         assert payload["message_thread_id"] == 9
                         assert "parse_mode" not in payload
-                        await runtime.service.handle_update(private_command("/stop", update_id=2))
+                        runtime.service.store.set_active_by_telegram(7001, False)
                         before = len(telegram.sends)
                         blocked = await session.call_tool(
                             "ping_user", {**params, "request_id": "demo-2"}

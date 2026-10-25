@@ -151,6 +151,13 @@ async def test_first_connect_code_completes_oauth_and_stays_scoped_after_reenrol
             access_token = response.json()["access_token"]
         grant = await runtime.oauth.load_access_token(access_token)
         assert grant.user_key == user["user_key"] and grant.telegram_user_id == 7001
+        await runtime.handle_update(command("🔌 Подключить AI-приложение"))
+        assert "Куда подключаем Telegram?" == bot.messages[-1]["text"]
+        await runtime.handle_update(command("/connect"))
+        next_login = re.search(r"Код входа: ([A-Z2-7-]+)", bot.messages[-1]["text"])[1]
+        assert next_login != login
+        assert runtime.service.store.get_user_by_telegram(7001)["user_key"] == user["user_key"]
+        assert await runtime.oauth.load_access_token(access_token) is not None
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             headers={"Authorization": "Bearer " + access_token},
@@ -220,7 +227,7 @@ async def test_button_runtime_keeps_controls_out_of_the_inbox(tmp_path):
     async with app.router.lifespan_context(app):
         await runtime.handle_update(incoming("/start", 1))
         assert bot.messages[-1]["reply_markup"]["is_persistent"] is True
-        await runtime.handle_update(incoming("🔌 Подключить", 2))
+        await runtime.handle_update(incoming("🔌 Подключить AI-приложение", 2))
         assert "Куда подключаем" in bot.messages[-1]["text"]
         assert runtime.service.find_users() == []
         await runtime.handle_update(callback("ui:claude", "synthetic-choose"))
@@ -232,10 +239,10 @@ async def test_button_runtime_keeps_controls_out_of_the_inbox(tmp_path):
         await runtime.handle_update(incoming("Synthetic actual inbox text", 3))
         assert len(runtime.inbox.list_messages()) == 1
         await runtime.handle_update(incoming("⏸ Пауза", 4))
-        assert runtime.service.store.get_user_by_telegram(7001)["active"] is False
+        assert runtime.service.store.get_user_by_telegram(7001)["active"] is True
         await runtime.handle_update(incoming("🔔 Включить", 5))
         assert runtime.service.store.get_user_by_telegram(7001)["active"] is True
-        await runtime.handle_update(incoming("🔗 Отключить", 6))
+        await runtime.handle_update(incoming("🔗 Отключить всё", 6))
         assert runtime.service.store.get_user_by_telegram(7001) is not None
         await runtime.handle_update(callback("ui:unlink_confirm", "synthetic-confirm"))
         assert runtime.service.store.get_user_by_telegram(7001) is None

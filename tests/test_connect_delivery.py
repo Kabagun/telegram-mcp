@@ -95,7 +95,7 @@ def setup_service(
 
 @pytest.mark.parametrize("active", [None, False, True])
 @pytest.mark.parametrize("text", ["/connect", "/connect@SYNTHETIC_BOT"])
-async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_existing_optin(
+async def test_connect_sends_guide_icon_menu_and_restores_existing_private_binding(
     tmp_path, active, text
 ) -> None:
     service, store, bot, issued = setup_service(tmp_path, active=active)
@@ -115,9 +115,7 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_e
     else:
         assert guide["reply_markup"] == markup
     assert bot.events[-1]["commands"] == command_menu(linked=True)
-    assert bot.documents[0]["reply_markup"] == menu_keyboard(
-        linked=True, active=active is not False
-    )
+    assert bot.documents[0]["reply_markup"] == menu_keyboard(linked=True)
     if active is None:
         users = store.list_users()
         assert len(users) == 1
@@ -127,37 +125,33 @@ async def test_connect_sends_formatted_guide_then_icon_then_menu_and_preserves_e
         assert user["first_name"] == "Synthetic"
         assert user["active"] is True
     else:
-        assert store.list_users() == before
-        user = before[0]
-    if active is not False:
-        assert issued == [user["user_key"]]
-        assert "Код входа: synthetic-code-1\n" in guide["text"]
-        sections = (
-            "Название: Telegram\n",
-            f"URL-адрес сервера: {PUBLIC_URL}\n",
-            "Аутентификация: OAuth\n\n🔑 Код подключения\n",
-            "Код входа: synthetic-code-1\n",
-            "Вставьте код в окне подключения.\n",
-            ICON_NOTE,
-        )
-        offsets = [guide["text"].index(section) for section in sections]
-        assert offsets == sorted(offsets)
-        assert "Без срока действия · одноразовый." in guide["text"]
-        assert "10 минут" not in guide["text"]
-        assert "приглашение" not in guide["text"]
-        assert any(entity["type"] == "bold" for entity in entities)
-        copies = [
-            button["copy_text"]["text"]
-            for row in markup["inline_keyboard"]
-            for button in row
-            if "copy_text" in button
-        ]
-        assert "synthetic-code-1" in copies
-        assert PUBLIC_URL in copies
-        assert "Telegram" in copies
-    else:
-        assert issued == []
-        assert "Код входа:" not in guide["text"]
+        assert store.list_users() == [{**before[0], "active": True}]
+        user = store.list_users()[0]
+    assert issued == [user["user_key"]]
+    assert "Код входа: synthetic-code-1\n" in guide["text"]
+    sections = (
+        "Название: Telegram\n",
+        f"URL-адрес сервера: {PUBLIC_URL}\n",
+        "Аутентификация: OAuth\n\n🔑 Код подключения\n",
+        "Код входа: synthetic-code-1\n",
+        "Вставьте код в окне подключения.\n",
+        ICON_NOTE,
+    )
+    offsets = [guide["text"].index(section) for section in sections]
+    assert offsets == sorted(offsets)
+    assert "Без срока действия · одноразовый." in guide["text"]
+    assert "10 минут" not in guide["text"]
+    assert "приглашение" not in guide["text"]
+    assert any(entity["type"] == "bold" for entity in entities)
+    copies = [
+        button["copy_text"]["text"]
+        for row in markup["inline_keyboard"]
+        for button in row
+        if "copy_text" in button
+    ]
+    assert "synthetic-code-1" in copies
+    assert PUBLIC_URL in copies
+    assert "Telegram" in copies
 
 
 @pytest.mark.parametrize(
@@ -273,9 +267,7 @@ async def test_other_commands_keep_plain_replies_and_never_send_icon(tmp_path, t
 
     assert [event["kind"] for event in bot.events] == ["message", "menu"]
     assert "entities" not in bot.sends[0]
-    assert bot.sends[0]["reply_markup"] == menu_keyboard(
-        linked=text != "/unlink", active=text != "/stop"
-    )
+    assert bot.sends[0]["reply_markup"] == menu_keyboard(linked=text != "/unlink")
     assert bot.documents == []
     assert issued == []
 

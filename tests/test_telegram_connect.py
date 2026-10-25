@@ -418,6 +418,38 @@ async def test_non_static_or_malformed_reply_keyboard_fails_before_network(marku
             )
 
 
+@pytest.mark.parametrize(
+    "markup",
+    [
+        {
+            "keyboard": [[{"text": label}]],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
+        for label in (
+            "🔌 Подключить",
+            "⏸ Пауза",
+            "🔔 Включить",
+            "🔗 Отключить",
+            "ℹ️ Помощь",
+        )
+    ]
+    + [
+        {"inline_keyboard": [[{"text": "Synthetic navigation", "callback_data": action}]]}
+        for action in ("ui:menu", "ui:start", "ui:stop", "ui:help")
+    ],
+)
+async def test_retired_outgoing_controls_fail_before_network(markup):
+    def forbidden(request):
+        pytest.fail("Retired controls must not reach Telegram")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(forbidden)) as client:
+        with pytest.raises(ValueError, match="Telegram reply markup is invalid"):
+            await TelegramClient(TOKEN, client=client).send_message(
+                CHAT_ID, "Guide", reply_markup=markup
+            )
+
+
 async def test_keyboard_accepts_row_button_and_utf16_length_boundaries():
     markup = {
         "inline_keyboard": [

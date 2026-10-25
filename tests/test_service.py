@@ -386,8 +386,8 @@ async def test_only_exact_supported_commands_receive_replies(service: Service, b
     assert service.find_users() == []
 
 
-async def test_link_commands_optout_resubscribe_and_unlink_are_safe_and_idempotent(
-    service: Service, bot: FakeBot
+async def test_link_commands_retired_stop_and_unlink_are_safe_and_idempotent(
+    service: Service, store: Store, bot: FakeBot
 ) -> None:
     await service.handle_update(command("/start"))
     assert bot.sends[-1]["text"].startswith("AI Connector")
@@ -402,7 +402,9 @@ async def test_link_commands_optout_resubscribe_and_unlink_are_safe_and_idempote
     assert token not in bot.sends[-1]["text"]
     for _ in range(2):
         await service.handle_update(command("/stop"))
-        assert service.get_user("synthetic")["active"] is False
+        assert service.get_user("synthetic")["active"] is True
+        assert bot.sends[-1]["text"].startswith("AI Connector")
+    store.set_active_by_telegram(7001, False)
     await service.handle_update(command("/start"))
     assert service.get_user("synthetic")["active"] is True
     unused = token_from(service.create_user_link("synthetic", "Renamed"))

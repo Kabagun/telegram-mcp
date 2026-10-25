@@ -23,28 +23,22 @@ _CLIENT_HEADINGS = {
 }
 CALLBACK_ACTIONS = frozenset(
     {
-        "ui:menu",
         "ui:connect",
         "ui:chatgpt",
         "ui:claude",
         "ui:other",
-        "ui:help",
         "ui:help_chatgpt",
         "ui:help_claude",
         "ui:help_other",
         "ui:privacy",
-        "ui:start",
-        "ui:stop",
         "ui:unlink",
         "ui:unlink_confirm",
+        "ui:cancel",
     }
 )
 BUTTON_ACTIONS = {
-    "🔌 Подключить": "ui:connect",
-    "⏸ Пауза": "ui:stop",
-    "🔔 Включить": "ui:start",
-    "🔗 Отключить": "ui:unlink",
-    "ℹ️ Помощь": "ui:help",
+    "🔌 Подключить AI-приложение": "ui:connect",
+    "🔗 Отключить всё": "ui:unlink",
 }
 _SECTION_HEADINGS = {
     *_CLIENT_HEADINGS.values(),
@@ -79,7 +73,6 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
 
     entities = []
     values = {}
-    endpoint = ""
     offset = 0
     for content in lines:
         if content in _SECTION_HEADINGS:
@@ -135,34 +128,31 @@ def onboarding_presentation(text: str) -> tuple[list[dict], dict | None]:
     keyboard = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
     keyboard.append(
         [
-            {"text": "Как подключить", "callback_data": f"ui:help_{client}"},
-            {"text": "Другое приложение", "callback_data": "ui:connect"},
+            {"text": "Инструкция", "callback_data": f"ui:help_{client}"},
+            {"text": "Приватность", "callback_data": "ui:privacy"},
         ]
     )
-    navigation = [{"text": "Приватность", "callback_data": "ui:privacy"}]
-    if endpoint:
-        navigation.append({"text": "Скачать PNG", "url": _icon_download_url(endpoint)})
-    navigation.append({"text": "Меню", "callback_data": "ui:menu"})
-    keyboard.append(navigation)
     return entities, {"inline_keyboard": keyboard} if keyboard else None
 
 
 def command_menu(*, linked: bool = False) -> list[dict[str, str]]:
     """Build a fresh Telegram command list for the current binding state."""
-    connect = {"command": "connect", "description": "Как подключить AI-чат"}
+    connect = {"command": "connect", "description": "Подключить AI-приложение"}
     if not linked:
         return [connect]
     return [
-        {"command": "start", "description": "Включить уведомления"},
         connect,
-        {"command": "stop", "description": "Отключить уведомления"},
-        {"command": "unlink", "description": "Удалить привязку"},
+        {"command": "unlink", "description": "Отключить все AI-приложения"},
     ]
 
 
 def intro_text(*, linked: bool) -> str:
     """Introduce the product briefly, with actions appropriate to the binding."""
-    actions = "Управляйте связью кнопками ниже." if linked else "Нажмите «🔌 Подключить» ниже."
+    actions = (
+        "Добавьте ещё одно AI-приложение или отключите все подключения кнопками ниже."
+        if linked
+        else "Нажмите «🔌 Подключить AI-приложение» ниже."
+    )
     return (
         "AI Connector соединяет Telegram с вашим AI-чатом. Чат может присылать "
         "уведомления и сообщения, читать ваши ответы и файлы.\n\n" + actions
@@ -205,11 +195,10 @@ def onboarding_text(
     )
 
 
-def menu_keyboard(*, linked: bool = False, active: bool = True) -> dict:
-    rows = [[{"text": "🔌 Подключить"}]]
+def menu_keyboard(*, linked: bool = False) -> dict:
+    rows = [[{"text": "🔌 Подключить AI-приложение"}]]
     if linked:
-        rows[0].append({"text": "⏸ Пауза" if active else "🔔 Включить"})
-        rows.append([{"text": "🔗 Отключить"}, {"text": "ℹ️ Помощь"}])
+        rows.append([{"text": "🔗 Отключить всё"}])
     return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
 
 
@@ -221,20 +210,11 @@ def client_picker() -> tuple[str, dict]:
                 {"text": "Claude", "callback_data": "ui:claude"},
             ],
             [{"text": "Другое", "callback_data": "ui:other"}],
-            [{"text": "Меню", "callback_data": "ui:menu"}],
         ]
     }
 
 
-def help_presentation(client: str | None = None) -> tuple[str, dict]:
-    if client is None:
-        return (
-            "Как это работает\n\nНажмите «🔌 Подключить» и выберите AI-приложение. "
-            "Добавьте в него Telegram по карточке настроек.\n\n"
-            "AI-чат сможет присылать уведомления, читать ваши ответы и файлы. "
-            "Модель выбирается в AI-приложении.",
-            client_picker()[1],
-        )
+def help_presentation(client: str, public_mcp_url: str = "") -> tuple[str, dict | None]:
     descriptions = {
         "chatgpt": (
             "Как подключить ChatGPT\n\n"
@@ -266,41 +246,28 @@ def help_presentation(client: str | None = None) -> tuple[str, dict]:
                 "url": "https://chatgpt.com/" if client == "chatgpt" else "https://claude.ai/",
             }
         )
-    row.append({"text": "Выбрать приложение", "callback_data": "ui:connect"})
-    return descriptions[client], {
-        "inline_keyboard": [
-            row,
-            [
-                {"text": "Приватность", "callback_data": "ui:privacy"},
-                {"text": "Меню", "callback_data": "ui:menu"},
-            ],
-        ]
-    }
+    endpoint = normalize_public_mcp_url(public_mcp_url)
+    if endpoint:
+        row.append({"text": "Скачать PNG", "url": _icon_download_url(endpoint)})
+    return descriptions[client], {"inline_keyboard": [row]} if row else None
 
 
-def privacy_presentation() -> tuple[str, dict]:
+def privacy_presentation() -> tuple[str, None]:
     text = PRIVACY_NOTICE.replace(
-        "Отключить — /unlink.", "Отключить связь можно кнопкой «🔗 Отключить»."
+        "Отключить — /unlink.", "Отключить связь можно кнопкой «🔗 Отключить всё»."
     )
-    return "Доступ и приватность\n\n" + text, {
-        "inline_keyboard": [
-            [
-                {"text": "Подключить", "callback_data": "ui:connect"},
-                {"text": "Меню", "callback_data": "ui:menu"},
-            ]
-        ]
-    }
+    return "Доступ и приватность\n\n" + text, None
 
 
 def unlink_presentation() -> tuple[str, dict]:
     return (
-        "Отключить AI-чат?\n\nПривязка и выданный доступ будут удалены. "
-        "Подключиться заново можно кнопкой «🔌 Подключить».",
+        "Отключить все AI-приложения?\n\nВсе подключения и коды входа для этого чата "
+        "будут удалены. Подключиться заново можно кнопкой «🔌 Подключить AI-приложение».",
         {
             "inline_keyboard": [
                 [
-                    {"text": "Да, отключить", "callback_data": "ui:unlink_confirm"},
-                    {"text": "Отмена", "callback_data": "ui:menu"},
+                    {"text": "Отключить всё", "callback_data": "ui:unlink_confirm"},
+                    {"text": "Отмена", "callback_data": "ui:cancel"},
                 ]
             ]
         },

@@ -30,24 +30,21 @@ from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
 _USERNAME = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
 _COMMAND = re.compile(
-    r"/(start|connect|stop|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
+    r"/(start|connect|unlink)(?:@([A-Za-z0-9_]{5,32}))?(?: ([A-Za-z0-9_-]{1,64}))?\Z"
 )
+_RETIRED_COMMAND = re.compile(r"/stop(?:@([A-Za-z0-9_]{5,32}))?\Z")
+_RETIRED_BUTTONS = frozenset({"⏸ Пауза", "🔔 Включить", "ℹ️ Помощь"})
+_RETIRED_CALLBACKS = frozenset({"ui:stop", "ui:start", "ui:help", "ui:menu"})
 _MAX_INTEGER = 2**63 - 1
 _FAILED = "Telegram rejected the message."
 _UNKNOWN = "Telegram delivery status is unknown."
-_INACTIVE = "The user has not enabled notifications."
+_INACTIVE = "Telegram delivery is unavailable for this user."
 _INVALID_LINK = "Ссылка недействительна или устарела. Запросите новое приглашение."
-_LINKED = "Связь подтверждена. Уведомления включены."
-_STARTED = "Уведомления включены."
-_STOPPED = "Уведомления отключены. Чтобы включить их снова, нажмите «🔔 Включить»."
-_UNLINKED = "Связь с вашим аккаунтом удалена. Подключиться заново можно кнопкой «🔌 Подключить»."
+_LINKED = "Связь подтверждена."
+_UNLINKED = "Все ваши AI-приложения отключены. Подключиться заново можно кнопкой ниже."
 _UNLINK_RETRY = "Не удалось удалить привязку. Попробуйте ещё раз."
-_CONNECT = "Чтобы подключить AI-чат, нажмите «Подключить»."
-_CONNECT_STOPPED = (
-    "Сначала нажмите «🔔 Включить». Затем нажмите «🔌 Подключить», "
-    "чтобы получить код входа для AI-чата."
-)
-_CONNECT_RETRY = "Не удалось получить код входа. Нажмите «Подключить» ещё раз."
+_CONNECT = "Нажмите «🔌 Подключить AI-приложение», чтобы начать подключение."
+_CONNECT_RETRY = "Не удалось получить код входа. Нажмите «🔌 Подключить AI-приложение» ещё раз."
 _CONNECT_ICON_NOTE = "📎 Иконка PNG — файлом ниже."
 _CONNECT_ICON_RETRY = (
     "Не удалось прикрепить иконку. Скачайте PNG кнопкой в инструкции или повторите подключение."
@@ -400,7 +397,7 @@ class Service:
 
     def _keyboard(self, telegram_id: int) -> dict[str, Any]:
         user = self._store.get_user_by_telegram(telegram_id)
-        return menu_keyboard(linked=user is not None, active=user is None or user["active"] is True)
+        return menu_keyboard(linked=user is not None)
 
     @staticmethod
     def _private_author(message: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
@@ -439,7 +436,7 @@ class Service:
             or not 1 <= len(query_id) <= 256
             or any(not "!" <= character <= "~" for character in query_id)
             or not isinstance(action, str)
-            or action not in CALLBACK_ACTIONS
+            or action not in CALLBACK_ACTIONS | _RETIRED_CALLBACKS
         ):
             return None
         message = query.get("message")
@@ -470,7 +467,7 @@ class Service:
         if user is None:
             return onboarding_text(self._public_mcp_url, client=client)
         if user.get("active") is not True:
-            return _CONNECT_STOPPED
+            return _CONNECT_RETRY
         response = onboarding_text(self._public_mcp_url, linked=True, client=client)
         if self._login_code_issuer is None:
             return response
@@ -479,7 +476,7 @@ class Service:
             if binding["telegram_user_id"] != telegram_id:
                 raise ServiceError("User has no verified Telegram binding.")
             if binding.get("active") is not True:
-                return _CONNECT_STOPPED
+                return _CONNECT_RETRY
             code = _safe_text(self._login_code_issuer(binding["user_key"]), maximum=128)
             return _message_text(
                 onboarding_text(self._public_mcp_url, linked=True, login_code=code, client=client)
@@ -488,16 +485,19 @@ class Service:
             return f"{response}\n\n{_CONNECT_RETRY}"
 
     async def _send_connect(self, telegram_id: int, author: dict[str, Any], *, client: str) -> None:
-        if self._login_code_issuer is not None:
-            username, first_name = self._author_profile(author)
-            try:
+        try:
+            if self._login_code_issuer is not None:
+                username, first_name = self._author_profile(author)
                 self._store.ensure_private_user(telegram_id, telegram_id, username, first_name)
-            except Exception:
-                response = (
-                    f"{onboarding_text(self._public_mcp_url, client=client)}\n\n{_CONNECT_RETRY}"
-                )
-            else:
-                response = self._connect_text(telegram_id, client=client)
+            user = self._store.get_user_by_telegram(telegram_id)
+            if user is not None:
+                binding = self._binding(user["user_key"])
+                if binding["telegram_user_id"] != telegram_id:
+                    raise ServiceError("User has no verified Telegram binding.")
+                if binding.get("active") is not True:
+                    self._store.set_active_by_telegram(telegram_id, True)
+        except Exception:
+            response = f"{onboarding_text(self._public_mcp_url, client=client)}\n\n{_CONNECT_RETRY}"
         else:
             response = self._connect_text(telegram_id, client=client)
         if _CONNECT_ICON_NOTE not in response:
@@ -553,9 +553,9 @@ class Service:
             return
         if action == "ui:connect":
             response, markup = client_picker()
-        elif action in {"ui:help", "ui:help_chatgpt", "ui:help_claude", "ui:help_other"}:
+        elif action in {"ui:help_chatgpt", "ui:help_claude", "ui:help_other"}:
             response, markup = help_presentation(
-                action.removeprefix("ui:help_") if action != "ui:help" else None
+                action.removeprefix("ui:help_"), self._public_mcp_url
             )
         elif action == "ui:privacy":
             response, markup = privacy_presentation()
@@ -565,9 +565,16 @@ class Service:
                     del self._pending_unlinks[next(iter(self._pending_unlinks))]
                 self._pending_unlinks[telegram_id] = (user["user_key"], now + 120)
             response, markup = unlink_presentation()
-        elif action == "ui:menu" or (action == "ui:unlink_confirm" and not confirming_unlink):
+        elif (
+            (not legacy and action in _RETIRED_CALLBACKS)
+            or action == "ui:cancel"
+            or (action == "ui:unlink_confirm" and not confirming_unlink)
+        ):
             response = intro_text(linked=self._store.get_user_by_telegram(telegram_id) is not None)
             markup = self._keyboard(telegram_id)
+            await self._reply(telegram_id, response, reply_markup=markup)
+            await self._refresh_commands(telegram_id)
+            return
         else:
             await self._management_control(action, telegram_id, author, token=token)
             return
@@ -586,16 +593,11 @@ class Service:
             else:
                 response = _LINKED
         elif name == "start":
-            if self._store.set_active_by_telegram(telegram_id, True):
-                response = _STARTED
-            else:
-                response = ""
+            self._store.set_active_by_telegram(telegram_id, True)
+            response = ""
         elif self._store.get_user_by_telegram(telegram_id) is None:
             response = _CONNECT
-        elif name == "stop":
-            self._store.set_active_by_telegram(telegram_id, False)
-            response = _STOPPED
-        else:
+        elif name in {"unlink", "unlink_confirm"}:
             user = self._store.get_user_by_telegram(telegram_id)
             if user is not None:
                 try:
@@ -606,6 +608,8 @@ class Service:
                     response = _UNLINKED
             else:
                 response = _UNLINKED
+        else:
+            return
         if name == "start":
             introduction = intro_text(
                 linked=self._store.get_user_by_telegram(telegram_id) is not None
@@ -642,6 +646,13 @@ class Service:
         action = BUTTON_ACTIONS.get(text)
         if action is not None:
             await self._control(action, telegram_id, author)
+            return True
+        retired = _RETIRED_COMMAND.fullmatch(text)
+        if text in _RETIRED_BUTTONS or (
+            retired is not None
+            and (retired[1] is None or retired[1].casefold() == self._bot_username.casefold())
+        ):
+            await self._control("ui:menu", telegram_id, author)
             return True
         command = _COMMAND.fullmatch(text)
         if command is None:

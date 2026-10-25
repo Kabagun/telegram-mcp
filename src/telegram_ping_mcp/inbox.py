@@ -575,7 +575,7 @@ class InboundController:
             size = metadata.get("file_size")
             if size is not None and _integer(size, minimum=0) > max_bytes:
                 self._raise_file_limit(size)
-            # Recheck after the network operation in case /stop or unlink was processed.
+            # Recheck after the network operation in case availability or binding changed.
             if not self._attachment_authorized(item):
                 raise ServiceError(_FILE_UNAVAILABLE)
             data = await self._bot.download_file(metadata["file_path"], max_bytes=max_bytes)
