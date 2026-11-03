@@ -34,6 +34,39 @@ def response(*messages):
     return types.messages.Messages(messages=list(messages), topics=[], chats=[], users=[])
 
 
+def service_message(message_id=10, chat_id=CHAT_ID):
+    return types.MessageService(
+        id=message_id,
+        peer_id=types.PeerUser(chat_id),
+        from_id=types.PeerUser(BOT_ID),
+        date=DATE,
+        out=True,
+        action=types.MessageActionPinMessage(),
+    )
+
+
+async def test_legacy_service_events_are_omitted_without_hiding_readable_messages():
+    reader, _, _ = make_reader(FakeClient(response(service_message(), message(11))))
+    assert set(await reader.fetch_recorded([10, 11])) == {11}
+    await reader.aclose()
+
+
+async def test_service_event_has_no_body_but_still_enforces_requested_chat():
+    reader, _, _ = make_reader(FakeClient(response(service_message())))
+    assert await reader.fetch_outgoing(CHAT_ID, [10]) == {}
+    await reader.aclose()
+    reader, _, _ = make_reader(FakeClient(response(service_message(chat_id=CHAT_ID + 1))))
+    with pytest.raises(HistoryUnavailable):
+        await reader.fetch_outgoing(CHAT_ID, [10])
+
+
+@pytest.mark.parametrize("native_id", [0, 11])
+async def test_service_events_cannot_bypass_message_id_validation(native_id):
+    reader, _, _ = make_reader(FakeClient(response(service_message(native_id))))
+    with pytest.raises(HistoryUnavailable):
+        await reader.fetch_recorded([10])
+
+
 class FakeClient:
     def __init__(self, result=None, *, user=None, failure=None, pause_at=None):
         self.result = response(message()) if result is None else result

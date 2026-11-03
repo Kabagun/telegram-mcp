@@ -263,7 +263,7 @@ class BotHistoryReader:
         result = {}
         seen = set()
         for message in messages:
-            if not isinstance(message, (types.Message, types.MessageEmpty)):
+            if not isinstance(message, (types.Message, types.MessageEmpty, types.MessageService)):
                 raise HistoryUnavailable()
             message_id = message.id
             if (
@@ -274,6 +274,15 @@ class BotHistoryReader:
                 raise HistoryUnavailable()
             seen.add(message_id)
             if isinstance(message, types.MessageEmpty):
+                continue
+            if isinstance(message, types.MessageService):
+                # Known legacy IDs can resolve to Telegram service events. They
+                # have no agent body and must not poison the entire backfill.
+                if chat_id is not None and (
+                    not isinstance(message.peer_id, types.PeerUser)
+                    or message.peer_id.user_id != chat_id
+                ):
+                    raise HistoryUnavailable()
                 continue
             peer = message.peer_id
             private = isinstance(peer, types.PeerUser) and _positive_int(peer.user_id, _MAX_CHAT_ID)
