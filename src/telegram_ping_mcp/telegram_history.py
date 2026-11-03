@@ -18,6 +18,24 @@ _TIMEOUT_SECONDS = 15
 _MAX_IDS = 100
 _MAX_MESSAGE_ID = 2**31 - 1
 _MAX_CHAT_ID = 2**63 - 1
+logger = logging.getLogger(__name__)
+
+
+def _diagnose_failure(operation: str, error: Exception) -> None:
+    # Class and source line only. Exception messages/args can contain credentials,
+    # request IDs or message bodies and must never enter the application's logs.
+    trace = error.__traceback__
+    line = 0
+    while trace is not None:
+        if trace.tb_frame.f_code.co_filename == __file__:
+            line = trace.tb_lineno
+        trace = trace.tb_next
+    logger.warning(
+        "Telegram history failed: operation=%s class=%s line=%d.",
+        operation,
+        type(error).__name__,
+        line,
+    )
 
 
 class HistoryUnavailable(Exception):
@@ -176,7 +194,8 @@ class BotHistoryReader:
         except asyncio.CancelledError:
             await self._disconnect_locked()
             raise
-        except Exception:
+        except Exception as error:
+            _diagnose_failure("authorize", error)
             failed = True
         if failed:
             await self._disconnect_locked()
@@ -228,7 +247,8 @@ class BotHistoryReader:
             except asyncio.CancelledError:
                 await self._disconnect_locked()
                 raise
-            except Exception:
+            except Exception as error:
+                _diagnose_failure("read", error)
                 failed = True
             if failed:
                 await self._disconnect_locked()

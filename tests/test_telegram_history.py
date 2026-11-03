@@ -299,7 +299,9 @@ async def test_failures_are_content_free_without_exception_context(stage, caplog
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
     assert secret not in "".join(traceback.format_exception(caught.value))
-    assert not caplog.records
+    assert len(caplog.records) == 1
+    assert "Telegram history failed:" in caplog.text
+    assert all(value not in caplog.text for value in (TOKEN, API_HASH, TEXT, "secret"))
     assert client.disconnects == 1
 
 
