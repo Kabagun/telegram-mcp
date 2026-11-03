@@ -29,7 +29,7 @@ from .telegram import (
 _MAX_INTEGER = 2**63 - 1
 _DEFAULT_FILE_LIMIT = MAX_ATTACHMENT_BYTES
 _ATTACHMENT_KINDS = {"document", "photo", "audio", "video", "voice", "animation"}
-_UNTRUSTED_FIELDS = {
+_FORWARDED_FIELDS = {
     "forward_origin",
     "forward_date",
     "forward_from",
@@ -37,6 +37,8 @@ _UNTRUSTED_FIELDS = {
     "forward_from_message_id",
     "forward_signature",
     "forward_sender_name",
+}
+_UNTRUSTED_FIELDS = {
     "is_automatic_forward",
     "sender_chat",
     "via_bot",
@@ -492,6 +494,7 @@ class InboundController:
         message = update["message"]
         if _UNTRUSTED_FIELDS.intersection(message) or _UNSUPPORTED_CONTENT.intersection(message):
             return
+        forwarded = bool(_FORWARDED_FIELDS.intersection(message))
         author, chat = message.get("from"), message.get("chat")
         if (
             not isinstance(author, dict)
@@ -507,7 +510,7 @@ class InboundController:
                 if chat_id != author_id:
                     return
             elif kind in {"group", "supergroup"}:
-                if chat_id >= 0 or chat_id not in self._allowed_group_chat_ids:
+                if forwarded or chat_id >= 0 or chat_id not in self._allowed_group_chat_ids:
                     return
             else:
                 return
@@ -525,8 +528,9 @@ class InboundController:
                 _integer(sent_at, minimum=0)
             text = _body(message["text"], 4096) if "text" in message else None
             caption = _body(message["caption"], 1024) if "caption" in message else None
-            if (text is not None and text.lstrip().startswith("/")) or (
-                caption is not None and caption.lstrip().startswith("/")
+            if not forwarded and (
+                (text is not None and text.lstrip().startswith("/"))
+                or (caption is not None and caption.lstrip().startswith("/"))
             ):
                 return
             attachment = self._attachment(message)

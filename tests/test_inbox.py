@@ -157,13 +157,6 @@ async def test_invalid_identity_or_message_metadata_is_ignored(setup, patch):
 @pytest.mark.parametrize(
     "field",
     [
-        "forward_origin",
-        "forward_date",
-        "forward_from",
-        "forward_from_chat",
-        "forward_from_message_id",
-        "forward_signature",
-        "forward_sender_name",
         "is_automatic_forward",
         "sender_chat",
         "via_bot",
@@ -172,10 +165,74 @@ async def test_invalid_identity_or_message_metadata_is_ignored(setup, patch):
         "sender_business_bot",
     ],
 )
-async def test_forwarded_edited_bot_and_business_messages_are_ignored(setup, field):
+async def test_automatic_edited_bot_and_business_messages_are_ignored(setup, field):
     _, inbox, _, controller = setup
     value = update()
     value["message"][field] = None
+    await controller.handle_update(value)
+    assert inbox.list_messages() == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "forward_origin": {
+                "type": "user",
+                "date": 1000,
+                "sender_user": {"id": 7002, "is_bot": False},
+            }
+        },
+        {
+            "forward_origin": {
+                "type": "hidden_user",
+                "date": 1000,
+                "sender_user_name": "Synthetic original author",
+            }
+        },
+        {
+            "forward_origin": {
+                "type": "channel",
+                "date": 1000,
+                "chat": {"id": -100999, "title": "Synthetic channel"},
+                "message_id": 9,
+            }
+        },
+        {
+            "forward_date": 1000,
+            "forward_from": {"id": 7002},
+            "forward_from_chat": {"id": -100999},
+            "forward_from_message_id": 9,
+            "forward_signature": "Synthetic signature",
+            "forward_sender_name": "Synthetic source",
+        },
+    ],
+)
+async def test_forwarded_private_content_uses_the_actual_verified_sender(setup, metadata):
+    _, inbox, bot, controller = setup
+    value = update()
+    value["message"].update(metadata)
+    await controller.handle_update(value)
+    await controller.handle_update(value)
+    [item] = inbox.list_messages()
+    assert item["text"] == CONTENT
+    assert (item["user_key"], item["telegram_user_id"], item["chat_id"]) == (
+        "synthetic",
+        7001,
+        7001,
+    )
+    assert "Synthetic source" not in repr(item)
+    assert bot.calls == []
+
+
+async def test_forwarded_group_content_still_is_not_ingested(setup):
+    _, inbox, _, controller = setup
+    value = update(chat_id=-100123, chat_type="supergroup")
+    value["message"]["forward_origin"] = {
+        "type": "hidden_user",
+        "date": 1000,
+        "sender_user_name": "Synthetic author",
+    }
     await controller.handle_update(value)
     assert inbox.list_messages() == []
 
