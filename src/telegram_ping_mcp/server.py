@@ -176,7 +176,11 @@ class Runtime:
                 await self.bot.set_commands(command_menu())
             except (TelegramAPIError, TelegramTransportError):
                 logger.warning("Telegram default command menu could not be updated.")
-            snapshot_history_migration(self.config.database_path)
+            runtime_data = os.environ.get("APP_DATA_DIR")
+            snapshot_history_migration(
+                self.config.database_path,
+                snapshot_directory=Path(runtime_data) if runtime_data else None,
+            )
             store = Store(self.config.database_path)
             self.inbox = InboxStore(self.config.database_path)
             self.service = Service(
