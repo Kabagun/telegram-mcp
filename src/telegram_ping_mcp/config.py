@@ -159,6 +159,29 @@ def _parse_bot_token(value: str) -> str:
     return value
 
 
+def _validate_history_credentials(api_id: object, api_hash: object) -> None:
+    if api_id is None and api_hash == "":
+        return
+    if api_id is None or api_hash == "":
+        raise ConfigError("TELEGRAM_API_ID and TELEGRAM_API_HASH must be configured together.")
+    if isinstance(api_id, bool) or not isinstance(api_id, int) or not 1 <= api_id <= 2**31 - 1:
+        raise ConfigError("TELEGRAM_API_ID must be a positive decimal integer up to 2147483647.")
+    if not isinstance(api_hash, str) or re.fullmatch(r"[A-Fa-f0-9]{32}", api_hash) is None:
+        raise ConfigError("TELEGRAM_API_HASH must contain exactly 32 hexadecimal characters.")
+
+
+def _parse_history_credentials(api_id: str, api_hash: str) -> tuple[int | None, str]:
+    if api_id == "" and api_hash == "":
+        return None, ""
+    if api_id == "" or api_hash == "":
+        raise ConfigError("TELEGRAM_API_ID and TELEGRAM_API_HASH must be configured together.")
+    if len(api_id) > 10 or _DECIMAL_INTEGER.fullmatch(api_id) is None:
+        raise ConfigError("TELEGRAM_API_ID must be a positive decimal integer up to 2147483647.")
+    parsed_id = int(api_id)
+    _validate_history_credentials(parsed_id, api_hash)
+    return parsed_id, api_hash
+
+
 def _parse_link_ttl(value: str) -> int:
     if not value:
         return DEFAULT_LINK_TTL_SECONDS
@@ -299,6 +322,8 @@ class Config:
     local_files_root: Path | None = None
     max_attachment_bytes: int = MAX_ATTACHMENT_BYTES
     public_mcp_url: str = ""
+    telegram_api_id: int | None = field(default=None, repr=False)
+    telegram_api_hash: str = field(default="", repr=False)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Config:
@@ -307,6 +332,9 @@ class Config:
         source = os.environ if environ is None else environ
         bot_token = _parse_bot_token(_setting(source, "TELEGRAM_BOT_TOKEN"))
         auth_token = _setting(source, "MCP_AUTH_TOKEN")
+        telegram_api_id, telegram_api_hash = _parse_history_credentials(
+            _setting(source, "TELEGRAM_API_ID"), _setting(source, "TELEGRAM_API_HASH")
+        )
 
         database_value = _setting(source, "DATABASE_PATH")
         if "\x00" in database_value:
@@ -332,6 +360,8 @@ class Config:
             ),
             max_attachment_bytes=_parse_attachment_limit(_setting(source, "MAX_ATTACHMENT_BYTES")),
             public_mcp_url=normalize_public_mcp_url(_setting(source, "PUBLIC_MCP_URL")),
+            telegram_api_id=telegram_api_id,
+            telegram_api_hash=telegram_api_hash,
         )
 
     def validate_for_serve(self, transport: str, host: str) -> None:
@@ -339,6 +369,7 @@ class Config:
 
         if not self.bot_token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required to serve.")
+        _validate_history_credentials(self.telegram_api_id, self.telegram_api_hash)
         normalize_public_mcp_url(self.public_mcp_url)
         normalized_api = normalize_api_base_url(self.api_base_url)
         _parse_local_files_root(str(self.local_files_root or ""), normalized_api)
@@ -363,6 +394,12 @@ class Config:
     def diagnostic(self) -> dict[str, bool]:
         """Return safe configuration status flags for the offline doctor command."""
 
+        try:
+            _validate_history_credentials(self.telegram_api_id, self.telegram_api_hash)
+        except ConfigError:
+            history_configured = False
+        else:
+            history_configured = self.telegram_api_id is not None
         return {
             "token_configured": bool(self.bot_token),
             "auth_token_configured": bool(self.auth_token),
@@ -373,4 +410,5 @@ class Config:
             "allowed_groups_configured": bool(self.allowed_group_chat_ids),
             "allowed_hosts_configured": bool(self.allowed_hosts),
             "polling_enabled": self.polling_enabled,
+            "telegram_history_configured": history_configured,
         }

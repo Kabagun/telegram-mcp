@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -130,6 +131,7 @@ class Service:
         public_mcp_url: str = "",
         login_code_issuer: Callable[[str], str] | None = None,
         user_unlinked: Callable[[str], None] | None = None,
+        sent_message_recorder: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
     ) -> None:
         if not isinstance(bot_username, str):
             raise ServiceError("Bot username is invalid.")
@@ -150,6 +152,7 @@ class Service:
         onboarding_text(public_mcp_url)
         self._login_code_issuer = login_code_issuer
         self._user_unlinked = user_unlinked
+        self._sent_message_recorder = sent_message_recorder
         self._pending_unlinks: dict[int, _UnlinkForm] = {}
 
     @property
@@ -288,6 +291,11 @@ class Service:
             return self._result(
                 request_id, {"status": "unknown", "error": _UNKNOWN}, duplicate=False
             )
+        if self._sent_message_recorder is not None and chat_id > 0 and len(users) == 1:
+            try:
+                self._sent_message_recorder(users[0], message)
+            except (ServiceError, sqlite3.Error):
+                logger.warning("Accepted Telegram send could not be indexed for history.")
         self._store.finish_delivery(request_id, "sent", message_id=message["message_id"])
         return self._result(
             request_id, {"status": "sent", "message_id": message["message_id"]}, duplicate=False

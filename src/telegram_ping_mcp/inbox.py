@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -76,6 +77,8 @@ _FILE_FAILED = "Telegram attachment could not be downloaded."
 _REPLY_FAILED = "Telegram rejected the message."
 _REPLY_UNKNOWN = "Telegram delivery status is unknown."
 _REPLY_FILE_FAILED = "Telegram attachment metadata is unavailable."
+_OUTGOING_INDEX_FAILED = "Outgoing message metadata could not be indexed."
+logger = logging.getLogger(__name__)
 
 
 def _integer(value: object, *, minimum: int = 1, maximum: int = _MAX_INTEGER) -> int:
@@ -124,10 +127,10 @@ def _mime_type(value: object, fallback: str) -> str:
 
 
 class InboxStore:
-    """Separate short SQLite operations in the same database as verified bindings.
+    """Store incoming bodies and an ID-only index of acknowledged outgoing messages.
 
-    Message bodies and file metadata are stored; attachment bytes and download URLs
-    are never persisted. Historical messages remain readable after opting out.
+    Outgoing bodies are read from Telegram and never enter SQLite. One shared ID
+    sequence makes mixed-history pagination stable without changing existing IDs.
     """
 
     def __init__(self, path: str | Path, now: Callable[[], float] | None = None) -> None:
@@ -161,6 +164,22 @@ class InboxStore:
                 CREATE INDEX IF NOT EXISTS inbound_messages_user ON inbound_messages (user_key, id);
                 """
             )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(inbound_messages)")
+            }
+            if "direction" not in columns:
+                try:
+                    connection.execute(
+                        "ALTER TABLE inbound_messages ADD COLUMN direction TEXT NOT NULL "
+                        "DEFAULT 'incoming' CHECK (direction IN ('incoming', 'outgoing'))"
+                    )
+                except sqlite3.OperationalError:
+                    # Another runtime may have completed the same additive migration.
+                    if "direction" not in {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(inbound_messages)")
+                    }:
+                        raise
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -173,7 +192,7 @@ class InboxStore:
             connection.close()
 
     @staticmethod
-    def _public(row: sqlite3.Row) -> dict[str, Any]:
+    def _public(row: sqlite3.Row, *, include_direction: bool = False) -> dict[str, Any]:
         result = {
             key: row[key]
             for key in (
@@ -190,6 +209,10 @@ class InboxStore:
             )
         }
         result["read"] = bool(row["is_read"])
+        if include_direction:
+            result["direction"] = row["direction"]
+            result["content_source"] = "telegram" if row["direction"] == "outgoing" else "stored"
+            result["content_available"] = row["direction"] == "incoming"
         result["attachment"] = None
         if row["attachment_id"] is not None:
             result["attachment"] = {
@@ -200,6 +223,75 @@ class InboxStore:
                 "size": row["attachment_size"],
             }
         return result
+
+    def record_outgoing(self, user: dict[str, Any], message: dict[str, Any]) -> None:
+        """Index a confirmed private bot send, excluding its text and caption."""
+        if not isinstance(user, dict) or not isinstance(message, dict):
+            raise ServiceError(_OUTGOING_INDEX_FAILED)
+        user_key = _safe_text(user.get("user_key"), maximum=128)
+        telegram_id = _integer(user.get("telegram_user_id"))
+        if _integer(user.get("chat_id")) != telegram_id:
+            raise ServiceError("Outgoing history requires a verified private chat.")
+        message_id = _integer(message.get("message_id"), maximum=2**31 - 1)
+        chat = message.get("chat")
+        if (
+            not isinstance(chat, dict)
+            or _integer(chat.get("id")) != telegram_id
+            or ("type" in chat and chat["type"] != "private")
+            or message.get("message_thread_id") is not None
+        ):
+            raise ServiceError("Outgoing acknowledgement has a different chat.")
+        sent_at = message.get("date")
+        if sent_at is None:
+            sent_at = int(self._now())
+        _integer(sent_at, minimum=0)
+        attachment = InboundController._attachment(message) or {}
+        if attachment:
+            # Incoming opaque IDs have a permissive legacy validator. Outgoing
+            # acknowledgements must never persist a URL in this metadata field.
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,4096}", attachment["file_id"]) is None:
+                raise ServiceError("Attachment identifier is invalid.")
+            source = message[attachment["kind"]]
+            if isinstance(source, list):
+                source = source[-1]
+            filename = source.get("file_name")
+            if isinstance(filename, str) and re.search(
+                r"[?#]|[A-Za-z][A-Za-z0-9+.-]*://", filename
+            ):
+                attachment["name"] = attachment["kind"]
+        failed = False
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    """INSERT OR IGNORE INTO inbound_messages (
+                    user_key, telegram_user_id, chat_id, telegram_message_id, topic_id,
+                    sent_at, received_at, text, caption, attachment_id, attachment_kind,
+                    attachment_name, attachment_mime_type, attachment_size, telegram_file_id,
+                    is_read, direction
+                ) SELECT ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 1, 'outgoing'
+                  FROM users WHERE user_key = ? AND telegram_user_id = ?
+                      AND chat_id = telegram_user_id AND active = 1""",
+                    (
+                        user_key,
+                        telegram_id,
+                        telegram_id,
+                        message_id,
+                        sent_at,
+                        self._now(),
+                        attachment.get("id"),
+                        attachment.get("kind"),
+                        attachment.get("name"),
+                        attachment.get("mime_type"),
+                        attachment.get("size"),
+                        attachment.get("file_id"),
+                        user_key,
+                        telegram_id,
+                    ),
+                )
+        except sqlite3.Error:
+            failed = True
+        if failed:
+            raise ServiceError(_OUTGOING_INDEX_FAILED)
 
     def _save(
         self,
@@ -252,9 +344,16 @@ class InboxStore:
         chat_id: int | None = None,
         after_id: int = 0,
         limit: int = 50,
+        *,
+        direction: str = "incoming",
+        include_direction: bool = False,
     ) -> list[dict[str, Any]]:
         _integer(after_id, minimum=0)
         _integer(limit, maximum=100)
+        if not isinstance(include_direction, bool):
+            raise ServiceError("Message direction inclusion is invalid.")
+        if not isinstance(direction, str) or direction not in {"incoming", "outgoing", "all"}:
+            raise ServiceError("Message direction must be incoming, outgoing or all.")
         if user_key is not None and (
             not isinstance(user_key, str) or not user_key.strip() or len(user_key) > 128
         ):
@@ -265,6 +364,9 @@ class InboxStore:
                 raise ServiceError("Chat identifier is invalid.")
         conditions = ["id > ?"]
         parameters: list[Any] = [after_id]
+        if direction != "all":
+            conditions.append("direction = ?")
+            parameters.append(direction)
         if user_key is not None:
             conditions.append("user_key = ?")
             parameters.append(user_key)
@@ -278,14 +380,25 @@ class InboxStore:
                 "ORDER BY id LIMIT ?",
                 parameters,
             ).fetchall()
-        return [self._public(row) for row in rows]
+        return [self._public(row, include_direction=include_direction) for row in rows]
 
-    def get_message(self, message_id: int) -> dict[str, Any] | None:
+    def get_message(
+        self, message_id: int, *, include_direction: bool = False
+    ) -> dict[str, Any] | None:
         _integer(message_id)
+        if not isinstance(include_direction, bool):
+            raise ServiceError("Message direction inclusion is invalid.")
         with self._connection() as connection:
-            row = connection.execute("SELECT * FROM inbound_messages WHERE id = ?", (message_id,))
+            condition = "" if include_direction else " AND direction = 'incoming'"
+            row = connection.execute(
+                "SELECT * FROM inbound_messages WHERE id = ?" + condition, (message_id,)
+            )
             message = row.fetchone()
-        return self._public(message) if message is not None else None
+        return (
+            self._public(message, include_direction=include_direction)
+            if message is not None
+            else None
+        )
 
     def mark_read(self, message_id: int) -> dict[str, Any]:
         _integer(message_id)
@@ -551,6 +664,13 @@ class InboundController:
             return Service._result(
                 request_id, {"status": "unknown", "error": _REPLY_UNKNOWN}, duplicate=False
             )
+        if chat_id == telegram_id:
+            try:
+                current_user = self._store.get_user(item["user_key"])
+                if current_user is not None:
+                    self._inbox.record_outgoing(current_user, message)
+            except (ServiceError, sqlite3.Error):
+                logger.warning(_OUTGOING_INDEX_FAILED)
         self._store.finish_delivery(request_id, "sent", message_id=message["message_id"])
         return Service._result(
             request_id, {"status": "sent", "message_id": message["message_id"]}, duplicate=False

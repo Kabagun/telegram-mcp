@@ -18,7 +18,12 @@ def _mock_configuration(monkeypatch: pytest.MonkeyPatch, config: Config) -> None
 def test_doctor_is_offline_and_redacts_configured_tokens(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config = Config(bot_token=BOT_TOKEN, auth_token=AUTH_TOKEN)
+    config = Config(
+        bot_token=BOT_TOKEN,
+        auth_token=AUTH_TOKEN,
+        telegram_api_id=7654321,
+        telegram_api_hash="b" * 32,
+    )
     _mock_configuration(monkeypatch, config)
 
     def unexpected(*_args: object, **_kwargs: object) -> None:
@@ -35,6 +40,11 @@ def test_doctor_is_offline_and_redacts_configured_tokens(
     assert "auth_token_configured" in captured.out
     assert BOT_TOKEN not in captured.out
     assert AUTH_TOKEN not in captured.out
+    assert json.loads(captured.out)["telegram_history_configured"] is True
+    assert "7654321" not in captured.out
+    assert "b" * 32 not in captured.out
+    assert "telegram_api_id" not in captured.out
+    assert "telegram_api_hash" not in captured.out
     assert captured.err == ""
 
 

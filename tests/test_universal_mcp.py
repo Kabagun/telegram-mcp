@@ -13,6 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from telegram_ping_mcp.config import Config
+from telegram_ping_mcp.conversation import ConversationHistory
 from telegram_ping_mcp.inbox import InboxStore
 from telegram_ping_mcp.server import create_mcp
 from telegram_ping_mcp.store import Store
@@ -95,11 +96,12 @@ def fixture(tmp_path):
         require_service=lambda: service,
         require_inbox=lambda: inbox,
         require_sender=lambda: sender,
+        require_history=lambda: ConversationHistory(store, inbox),
     )
     mcp = create_mcp(runtime)
     app = mcp.streamable_http_app()
     app.add_middleware(SyntheticPrincipalMiddleware)
-    messages = inbox.list_messages()
+    messages = inbox.list_messages(direction="all", include_direction=True)
     return SimpleNamespace(
         mcp=mcp,
         app=app,

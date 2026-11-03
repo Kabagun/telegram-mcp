@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
+import sqlite3
 from typing import Any
 
 from .config import MAX_ATTACHMENT_BYTES
@@ -31,6 +33,7 @@ _PREPARATION_ERRORS = {
     "Numeric identifier or limit is invalid.",
 }
 _KINDS = {"document", "photo", "audio", "video", "voice", "animation"}
+logger = logging.getLogger(__name__)
 
 
 class OutboundSender:
@@ -125,7 +128,7 @@ class OutboundSender:
         user = self._binding(user_key)
         reply_id = None
         if message_id is not None:
-            target = self._inbox.get_message(_integer(message_id))
+            target = self._inbox.get_message(_integer(message_id), include_direction=True)
             if target is None or not self._belongs(target, user):
                 raise ServiceError(_REPLY_UNAVAILABLE)
             reply_id = _integer(target["telegram_message_id"])
@@ -303,6 +306,10 @@ class OutboundSender:
             return Service._result(
                 request_id, {"status": "unknown", "error": _UNKNOWN}, duplicate=False
             )
+        try:
+            self._inbox.record_outgoing(user, message)
+        except (ServiceError, sqlite3.Error):
+            logger.warning("Accepted Telegram send could not be indexed for history.")
         self._store.finish_delivery(request_id, "sent", message_id=message["message_id"])
         return Service._result(
             request_id, {"status": "sent", "message_id": message["message_id"]}, duplicate=False

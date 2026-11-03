@@ -61,6 +61,13 @@ class Store:
                     message_id INTEGER,
                     error TEXT
                 );
+                CREATE INDEX IF NOT EXISTS deliveries_sent_ids ON deliveries (status, message_id);
+                CREATE TABLE IF NOT EXISTS history_backfill_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    last_message_id INTEGER NOT NULL
+                        CHECK (last_message_id BETWEEN 0 AND 2147483647)
+                );
+                INSERT OR IGNORE INTO history_backfill_state VALUES (1, 0);
                 """
             )
 
@@ -328,6 +335,48 @@ class Store:
             connection.execute(
                 "UPDATE update_offset SET next_offset = max(next_offset, ?) WHERE singleton = 1",
                 (next_offset,),
+            )
+
+    def list_sent_delivery_ids(self, after_message_id: int = 0, limit: int = 100) -> list[int]:
+        """Return bounded native IDs from accepted deliveries for internal backfill.
+
+        Delivery records do not identify a recipient. The caller must retrieve
+        each ID from Telegram and verify its outgoing private peer before adding
+        it to a currently active user's metadata-only index.
+        """
+        self._integer(after_message_id, "History message identifier")
+        self._integer(limit, "History batch limit", minimum=1)
+        if after_message_id > 2**31 - 1 or limit > 100:
+            raise ValueError("History batch bounds are invalid.")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT message_id FROM deliveries
+                   WHERE status = 'sent' AND typeof(message_id) = 'integer'
+                       AND message_id > ? AND message_id BETWEEN 1 AND 2147483647
+                       AND request_id NOT GLOB 'release:*'
+                       AND request_id NOT GLOB 'release-message:*'
+                   ORDER BY message_id LIMIT ?""",
+                (after_message_id, limit),
+            ).fetchall()
+        return [row["message_id"] for row in rows]
+
+    def get_history_backfill_cursor(self) -> int:
+        """Read the native-message cursor; no message bodies are stored here."""
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT last_message_id FROM history_backfill_state WHERE singleton = 1"
+            ).fetchone()[0]
+
+    def set_history_backfill_cursor(self, value: int) -> None:
+        """Advance only after a successful batch; concurrent updates cannot rewind."""
+        self._integer(value, "History backfill cursor")
+        if value > 2**31 - 1:
+            raise ValueError("History backfill cursor is invalid.")
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE history_backfill_state SET last_message_id = max(last_message_id, ?) "
+                "WHERE singleton = 1",
+                (value,),
             )
 
     @staticmethod

@@ -214,7 +214,14 @@ async def test_universal_send_runtime_keeps_private_target_reply_file_and_dedup(
             assert payload(await session.call_tool("get_profiles", {})) == [
                 {"id": "7001", "name": "@synthetic_alpha", "nickname": "@synthetic_alpha"}
             ]
-            assert payload(await session.call_tool("get_messages", {})) == [server.own]
+            assert payload(await session.call_tool("get_messages", {})) == [
+                {
+                    **server.own,
+                    "direction": "incoming",
+                    "content_source": "stored",
+                    "content_available": True,
+                }
+            ]
             arguments = {
                 "profile_id": "7001",
                 "request_id": "synthetic-universal-text",
@@ -273,6 +280,72 @@ async def test_universal_send_runtime_keeps_private_target_reply_file_and_dedup(
                 assert result.isError
                 assert "Access denied." in result.content[0].text
             assert len(server.telegram.sends) == 3
+
+
+async def test_oauth_mixed_history_fetches_only_own_outgoing_and_preserves_connections(server):
+    class LiveReader:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_recorded(self, ids):
+            return {}
+
+        async def fetch_outgoing(self, chat_id, ids):
+            self.calls.append((chat_id, ids))
+            return {
+                native_id: {"text": f"Synthetic sent to {chat_id}", "has_media": False}
+                for native_id in ids
+            }
+
+    async with server() as fixture:
+        reader = LiveReader()
+        fixture.runtime.history.reader = reader
+        for key, native_id in ((ALPHA, 101), (BETA, 102)):
+            user = fixture.runtime.service.store.get_user(key)
+            fixture.runtime.inbox.record_outgoing(
+                user, {"message_id": native_id, "chat": {"id": user["chat_id"]}}
+            )
+        foreign = fixture.runtime.inbox.list_messages(
+            BETA, direction="outgoing", include_direction=True
+        )[0]
+        async with connected(fixture, "alpha") as session:
+            items = payload(await session.call_tool("get_messages", {}))
+            assert [item["direction"] for item in items] == ["incoming", "outgoing"]
+            assert items[-1]["text"] == "Synthetic sent to 7001"
+            assert reader.calls == [(7001, [101])]
+            assert (await session.call_tool("get_messages", {"message_id": foreign["id"]})).isError
+            assert reader.calls == [(7001, [101])]
+            result = payload(
+                await session.call_tool(
+                    "send_message",
+                    {
+                        "profile_id": "7001",
+                        "request_id": "reply-to-outgoing",
+                        "text": "Synthetic",
+                        "message_id": items[-1]["id"],
+                    },
+                )
+            )
+            assert result["status"] == "sent"
+            assert fixture.telegram.sends[-1]["reply_parameters"]["message_id"] == 101
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=fixture.app),
+            base_url=BASE_URL,
+            headers={"Authorization": "Bearer " + fixture.tokens["alpha"]},
+        ) as http:
+            response = await http.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                },
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+            assert response.headers["x-accel-buffering"] == "no"
 
 
 async def test_oauth_tools_reject_foreign_and_group_resources_before_side_effects(server):

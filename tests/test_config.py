@@ -1,4 +1,5 @@
-from dataclasses import FrozenInstanceError
+import traceback
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,9 @@ def test_from_env_uses_safe_defaults() -> None:
     assert config.api_base_url == DEFAULT_API_BASE_URL
     assert config.local_files_root is None
     assert config.max_attachment_bytes == 100 * 1024 * 1024
+    assert config.telegram_api_id is None
+    assert config.telegram_api_hash == ""
+    assert config.diagnostic()["telegram_history_configured"] is False
 
 
 def test_from_env_parses_supported_values() -> None:
@@ -160,6 +164,7 @@ def test_diagnostic_contains_status_only_and_never_secrets() -> None:
         "allowed_groups_configured": False,
         "allowed_hosts_configured": True,
         "polling_enabled": True,
+        "telegram_history_configured": False,
     }
     assert bot_token not in repr(status)
     assert auth_token not in repr(status)
@@ -260,3 +265,123 @@ def test_local_files_root_requires_local_endpoint_and_absolute_path(tmp_path):
                 "TELEGRAM_LOCAL_FILES_ROOT": "relative/files",
             }
         )
+
+
+@pytest.mark.parametrize("api_id", ["1", "0042", "2147483647"])
+@pytest.mark.parametrize("api_hash", ["a" * 32, "0123456789abcdefABCDEF0123456789"])
+def test_optional_bot_history_credentials_parse_and_validate(api_id, api_hash):
+    config = Config.from_env(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:synthetic-test-token",
+            "TELEGRAM_API_ID": api_id,
+            "TELEGRAM_API_HASH": api_hash,
+        }
+    )
+    assert config.telegram_api_id == int(api_id)
+    assert config.telegram_api_hash == api_hash
+    assert config.diagnostic()["telegram_history_configured"] is True
+    config.validate_for_serve("stdio", "127.0.0.1")
+
+
+def test_empty_bot_history_pair_disables_optional_reader():
+    config = Config.from_env({"TELEGRAM_API_ID": "", "TELEGRAM_API_HASH": ""})
+    assert config.telegram_api_id is None
+    assert config.telegram_api_hash == ""
+    assert config.diagnostic()["telegram_history_configured"] is False
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"TELEGRAM_API_ID": "7654321"},
+        {"TELEGRAM_API_HASH": "b" * 32},
+        {"TELEGRAM_API_ID": "", "TELEGRAM_API_HASH": "b" * 32},
+        {"TELEGRAM_API_ID": "7654321", "TELEGRAM_API_HASH": ""},
+    ],
+)
+def test_bot_history_credentials_require_the_complete_pair(values):
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env(values)
+    assert str(caught.value) == (
+        "TELEGRAM_API_ID and TELEGRAM_API_HASH must be configured together."
+    )
+    output = "".join(traceback.format_exception(caught.value))
+    assert all(value not in output for value in values.values() if value)
+
+
+@pytest.mark.parametrize(
+    "api_id",
+    ["0", "-1", "+1", "1.5", " 42", "42 ", "42\n", "１２", "٤٢", "2147483648", "9" * 5000],
+)
+def test_bot_history_api_id_is_bounded_ascii_decimal(api_id):
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env({"TELEGRAM_API_ID": api_id, "TELEGRAM_API_HASH": "a" * 32})
+    assert str(caught.value) == (
+        "TELEGRAM_API_ID must be a positive decimal integer up to 2147483647."
+    )
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "api_hash", ["private-synthetic-value", "a" * 31, "a" * 33, "g" * 32, " " * 32]
+)
+def test_bot_history_api_hash_requires_exactly_32_hex_characters(api_hash):
+    with pytest.raises(ConfigError) as caught:
+        Config.from_env({"TELEGRAM_API_ID": "7654321", "TELEGRAM_API_HASH": api_hash})
+    assert str(caught.value) == "TELEGRAM_API_HASH must contain exactly 32 hexadecimal characters."
+    if api_hash.strip():
+        assert api_hash not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("name", ["TELEGRAM_API_ID", "TELEGRAM_API_HASH"])
+@pytest.mark.parametrize("value", [True, 42, None])
+def test_bot_history_env_values_must_be_text(name, value):
+    with pytest.raises(ConfigError, match=f"{name} must be text"):
+        Config.from_env({name: value})
+
+
+@pytest.mark.parametrize(
+    "api_id,api_hash",
+    [
+        (True, "a" * 32),
+        (False, "a" * 32),
+        ("42", "a" * 32),
+        (42.0, "a" * 32),
+        (0, "a" * 32),
+        (-1, "a" * 32),
+        (2**31, "a" * 32),
+        (None, "a" * 32),
+        (42, ""),
+        (42, None),
+        (42, True),
+        (42, "private-synthetic-value"),
+        (42, "a" * 32 + "\n"),
+    ],
+)
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+def test_direct_config_history_credentials_are_validated_without_coercion(
+    api_id, api_hash, transport
+):
+    config = Config(
+        bot_token="123456:synthetic-test-token",
+        auth_token="s" * 32,
+        telegram_api_id=api_id,
+        telegram_api_hash=api_hash,
+    )
+    with pytest.raises(ConfigError):
+        config.validate_for_serve(transport, "127.0.0.1")
+    assert config.diagnostic()["telegram_history_configured"] is False
+
+
+def test_bot_history_credentials_are_hidden_from_repr_and_diagnostics():
+    config = Config(telegram_api_id=7654321, telegram_api_hash="b" * 32)
+    assert "7654321" not in repr(config)
+    assert "b" * 32 not in repr(config)
+    secret_fields = {item.name: item.repr for item in fields(Config)}
+    assert secret_fields["telegram_api_id"] is False
+    assert secret_fields["telegram_api_hash"] is False
+    diagnostic = config.diagnostic()
+    assert diagnostic["telegram_history_configured"] is True
+    assert "telegram_api_id" not in diagnostic
+    assert "telegram_api_hash" not in diagnostic
+    assert all(type(value) is bool for value in diagnostic.values())
