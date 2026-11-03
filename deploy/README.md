@@ -40,6 +40,11 @@ configuration, SQLite data and persistent Bot API state outside source replaceme
 preserve their existing paths, permissions and the native Bot API installation.
 Take a consistent database backup before any schema migration.
 
+For the 1.2.0 sent-history migration, the application creates that snapshot under
+its existing runtime identity, before opening the stores that install the new
+schema. Startup stops if the snapshot fails. The `apps` deployment owner does not
+need access to the runtime's private environment file or message database.
+
 After preparing the source and dependency directories, restart the application
 with its saved declaration:
 

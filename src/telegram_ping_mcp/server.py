@@ -34,6 +34,7 @@ from .broadcast import BroadcastError, broadcast_release
 from .config import Config
 from .conversation import ConversationHistory
 from .inbox import InboundController, InboxStore
+from .migration import snapshot_history_migration
 from .oauth import OAUTH_SCOPE, OAuthProvider
 from .onboarding import command_menu
 from .outbound import OutboundSender
@@ -175,6 +176,7 @@ class Runtime:
                 await self.bot.set_commands(command_menu())
             except (TelegramAPIError, TelegramTransportError):
                 logger.warning("Telegram default command menu could not be updated.")
+            snapshot_history_migration(self.config.database_path)
             store = Store(self.config.database_path)
             self.inbox = InboxStore(self.config.database_path)
             self.service = Service(
