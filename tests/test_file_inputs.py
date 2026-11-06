@@ -20,6 +20,12 @@ GENERATED_PDF = {
     "file_name": "Синтетический отчёт.pdf",
     "mime_type": "application/pdf",
 }
+AZURE_HOST = "oaisdmntprdenmarkeast.blob.core.windows.net"
+SYNTHETIC_SAS = "sp=r&sr=b&sv=2025-01-05&se=2030-01-01T00%3A00%3A00Z&sig=synthetic-secret"
+GENERATED_AZURE_PDF = {
+    **GENERATED_PDF,
+    "download_url": f"https://{AZURE_HOST}/synthetic-container/report.pdf?{SYNTHETIC_SAS}",
+}
 
 
 def test_file_adapter_preserves_safe_metadata_and_hides_signed_url_in_repr():
@@ -223,7 +229,7 @@ async def test_network_exception_is_content_free():
     assert "secret" not in str(caught.value)
 
 
-@pytest.mark.parametrize("host", ["files.openai.com", "files.oaiusercontent.com"])
+@pytest.mark.parametrize("host", ["files.openai.com", "files.oaiusercontent.com", AZURE_HOST])
 @pytest.mark.parametrize("port", ["", ":443"])
 def test_native_attached_and_generated_sources_accept_the_default_https_port(host, port):
     parsed = parse_file_input(
@@ -302,29 +308,30 @@ def test_generated_file_source_keeps_exact_host_and_safe_url_boundaries(url):
     assert url not in str(caught.value)
 
 
+@pytest.mark.parametrize("file", [GENERATED_PDF, GENERATED_AZURE_PDF])
 @pytest.mark.parametrize(
     "addresses",
     [("127.0.0.1",), ("169.254.169.254",), ("::1",), ("93.184.216.34", "10.0.0.1")],
 )
-async def test_generated_file_host_still_requires_only_public_dns_results(addresses):
+async def test_generated_file_host_still_requires_only_public_dns_results(addresses, file):
     downloader, calls, options = downloader_for(
-        httpx.Response(200), addresses=addresses, host="files.openai.com"
+        httpx.Response(200), addresses=addresses, host=httpx.URL(file["download_url"]).host
     )
     with pytest.raises(ServiceError, match="could not be downloaded"):
-        await downloader.download(parse_file_input(GENERATED_PDF), max_bytes=200000)
+        await downloader.download(parse_file_input(file), max_bytes=200000)
     assert calls == []
     assert options == []
 
 
-async def test_generated_pdf_download_preserves_bytes_and_uses_pinned_host_and_tls(monkeypatch):
+@pytest.mark.parametrize("host", ["files.openai.com", AZURE_HOST])
+async def test_generated_pdf_download_preserves_bytes_and_uses_pinned_host_and_tls(
+    monkeypatch, host
+):
     data = (b"%PDF-1.7\n" + b"synthetic-pdf-body\n" * 6400)[: 112 * 1024]
     assert len(data) == 112 * 1024
     calls = []
     resolved = []
-    url = (
-        "https://files.openai.com:443/content/Синтетический отчёт.pdf"
-        "?signature=synthetic&name=отчёт"
-    )
+    url = f"https://{host}:443/content/Синтетический отчёт.pdf?{SYNTHETIC_SAS}&name=отчёт"
 
     async def handler(request):
         calls.append(request)
@@ -348,26 +355,81 @@ async def test_generated_pdf_download_preserves_bytes_and_uses_pinned_host_and_t
     parsed = parse_file_input({**GENERATED_PDF, "download_url": url})
     result = await FileDownloader(resolver=resolver).download(parsed, max_bytes=200000)
     assert result == data
-    assert resolved == ["files.openai.com"]
+    assert resolved == [host]
     assert len(calls) == 1
     request = calls[0]
     assert request.url.host == "93.184.216.34"
     assert request.url.port is None
-    assert request.headers["host"] == "files.openai.com"
-    assert request.extensions["sni_hostname"] == "files.openai.com"
+    assert request.headers["host"] == host
+    assert request.extensions["sni_hostname"] == host
     assert request.headers["accept-encoding"] == "identity"
     expected = httpx.URL(url)
     assert request.url.raw_path == expected.raw_path
 
 
-async def test_generated_file_redirect_does_not_follow_or_read_response_body():
+@pytest.mark.parametrize("file", [GENERATED_PDF, GENERATED_AZURE_PDF])
+async def test_generated_file_redirect_does_not_follow_or_read_response_body(file):
     stream = Chunks([b"synthetic private redirect body"])
     downloader, calls, options = downloader_for(
         httpx.Response(302, headers={"location": "http://127.0.0.1/private"}, stream=stream),
-        host="files.openai.com",
+        host=httpx.URL(file["download_url"]).host,
     )
     with pytest.raises(ServiceError, match="could not be downloaded"):
-        await downloader.download(parse_file_input(GENERATED_PDF), max_bytes=200000)
+        await downloader.download(parse_file_input(file), max_bytes=200000)
     assert len(calls) == 1
     assert options[0]["follow_redirects"] is False
+    assert stream.read == 0
+
+
+def test_observed_native_blob_provider_preserves_pdf_metadata_and_retry_identity():
+    parsed = parse_file_input(GENERATED_AZURE_PDF)
+    assert parsed.file_name == GENERATED_PDF["file_name"]
+    assert parsed.mime_type == "application/pdf"
+    assert parsed.source_identity == f"https://{AZURE_HOST}/synthetic-container/report.pdf"
+    renewed = parse_file_input(
+        {
+            **GENERATED_AZURE_PDF,
+            "download_url": GENERATED_AZURE_PDF["download_url"].replace(
+                "synthetic-secret", "renewed"
+            ),
+        }
+    )
+    assert parsed.fingerprint_data() == renewed.fingerprint_data()
+    assert "synthetic-secret" not in repr(parsed)
+    assert "sig=" not in parsed.source_identity
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        "another-account.blob.core.windows.net",
+        "oaisdmntprdenmarkeast2.blob.core.windows.net",
+        "eviloaisdmntprdenmarkeast.blob.core.windows.net",
+        "sub.oaisdmntprdenmarkeast.blob.core.windows.net",
+        "oaisdmntprdenmarkeast.blob.core.windows.net.evil.example",
+        "oaisdmntprdenmarkeast.blob.core.windows.net.",
+        "user:synthetic-secret@oaisdmntprdenmarkeast.blob.core.windows.net",
+        "oaisdmntprdenmarkeast.blob.core.windows.net@evil.example",
+        "oaisdmntprdenmarkeast.blob.core.windows.net:8443",
+        "oaisdmntprdenmarkeast.blob.core.windows.net:80",
+        "oaisdmntprdenmarkeast.blob.core.windows.net:0443",
+        "127.0.0.1",
+    ],
+)
+def test_native_blob_host_does_not_allow_other_tenants_or_url_authority_variants(authority):
+    url = f"https://{authority}/synthetic-container/report.pdf?{SYNTHETIC_SAS}"
+    with pytest.raises(ServiceError) as caught:
+        parse_file_input({**GENERATED_AZURE_PDF, "download_url": url})
+    assert authority not in str(caught.value)
+    assert "synthetic-secret" not in str(caught.value)
+
+
+async def test_native_blob_download_keeps_response_size_limit_before_reading_body():
+    stream = Chunks([b"synthetic-private-body"])
+    downloader, calls, _ = downloader_for(
+        httpx.Response(200, headers={"content-length": "200001"}, stream=stream), host=AZURE_HOST
+    )
+    with pytest.raises(ServiceError, match="exceeds"):
+        await downloader.download(parse_file_input(GENERATED_AZURE_PDF), max_bytes=200000)
+    assert len(calls) == 1
     assert stream.read == 0

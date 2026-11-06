@@ -22,6 +22,7 @@ _UNAVAILABLE = "Attached file could not be downloaded."
 _TOO_LARGE = "Attachment exceeds the allowed send size."
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _FILE_KEYS = {"download_url", "file_id", "mime_type", "file_name"}
+_NATIVE_FILE_HOSTS = {"files.openai.com", "oaisdmntprdenmarkeast.blob.core.windows.net"}
 _UPLOAD_MIME = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\Z")
 
 
@@ -67,7 +68,7 @@ def _file_url(value: object) -> tuple[str, str]:
             or parts.username is not None
             or parts.password is not None
             or parts.port not in {None, 443}
-            or not (host == "files.openai.com" or host.endswith(".oaiusercontent.com"))
+            or not (host in _NATIVE_FILE_HOSTS or host.endswith(".oaiusercontent.com"))
             or len(host) > 253
             or not all(_HOST_LABEL.fullmatch(label) for label in host.split("."))
             or not parts.path.startswith("/")
