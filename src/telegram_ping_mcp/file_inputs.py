@@ -17,7 +17,7 @@ from .config import MAX_ATTACHMENT_BYTES
 from .inbox import _filename
 from .service import ServiceError, _integer
 
-_INVALID = "File input is invalid; use an attached file supplied by the client."
+_INVALID = "File input is invalid; use an attached or generated file supplied by the native client."
 _UNAVAILABLE = "Attached file could not be downloaded."
 _TOO_LARGE = "Attachment exceeds the allowed send size."
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -48,9 +48,8 @@ def _file_url(value: object) -> tuple[str, str]:
     if (
         not isinstance(value, str)
         or not 1 <= len(value) <= 8192
-        or not value.isascii()
-        or any(character.isspace() or ord(character) < 32 for character in value)
-        or "\x7f" in value
+        or not value.lower().startswith("https://")
+        or any(unicodedata.category(character)[0] == "C" for character in value)
         or "\\" in value
         or "#" in value
     ):
@@ -63,19 +62,26 @@ def _file_url(value: object) -> tuple[str, str]:
         host = parts.hostname or ""
         if (
             parts.scheme != "https"
-            or parts.netloc.lower() != host
+            or not parts.netloc.isascii()
+            or parts.netloc.lower() not in {host, f"{host}:443"}
             or parts.username is not None
             or parts.password is not None
-            or parts.port is not None
-            or not host.endswith(".oaiusercontent.com")
+            or parts.port not in {None, 443}
+            or not (host == "files.openai.com" or host.endswith(".oaiusercontent.com"))
             or len(host) > 253
             or not all(_HOST_LABEL.fullmatch(label) for label in host.split("."))
             or not parts.path.startswith("/")
         ):
             raise ServiceError(_INVALID)
+        # Match the URL encoding used for the actual request. Default HTTPS ports
+        # and expiring queries must not change an otherwise identical file's retry
+        # identity. Keep the original URL only in memory for the download itself.
+        canonical = httpx.URL(value)
+        if len(str(canonical)) > 8192:
+            raise ServiceError(_INVALID)
     except ValueError:
         raise ServiceError(_INVALID) from None
-    return host, f"https://{host}{parts.path}"
+    return host, str(canonical.copy_with(query=None))
 
 
 def parse_file_input(value: object) -> FileInput:

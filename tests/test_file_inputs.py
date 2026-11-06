@@ -14,6 +14,12 @@ FILE = {
     "file_name": "../example.txt",
     "mime_type": "text/plain",
 }
+GENERATED_PDF = {
+    "download_url": "https://files.openai.com/content/synthetic-generated/report.pdf?signature=synthetic",
+    "file_id": "file-synthetic-generated-pdf",
+    "file_name": "Синтетический отчёт.pdf",
+    "mime_type": "application/pdf",
+}
 
 
 def test_file_adapter_preserves_safe_metadata_and_hides_signed_url_in_repr():
@@ -54,7 +60,7 @@ def test_mime_normalization_matches_upload_transport_grammar(mime):
         "https://oaiusercontent.com/file",
         "https://eviloaiusercontent.com/file",
         "https://files.oaiusercontent.com.evil.example/file",
-        "https://files.oaiusercontent.com:443/file",
+        "https://files.oaiusercontent.com:444/file",
         "https://user:secret@files.oaiusercontent.com/file",
         "https://files.oaiusercontent.com/file#fragment",
         "https://files.oaiusercontent.com/file#",
@@ -104,7 +110,7 @@ class Chunks(httpx.AsyncByteStream):
             yield chunk
 
 
-def downloader_for(response, *, addresses=("93.184.216.34",)):
+def downloader_for(response, *, addresses=("93.184.216.34",), host="files.oaiusercontent.com"):
     calls = []
     options = []
 
@@ -116,8 +122,8 @@ def downloader_for(response, *, addresses=("93.184.216.34",)):
         options.append(kwargs)
         return httpx.AsyncClient(**{**kwargs, "transport": httpx.MockTransport(handler)})
 
-    async def resolver(host):
-        assert host == "files.oaiusercontent.com"
+    async def resolver(requested_host):
+        assert requested_host == host
         return addresses
 
     return FileDownloader(client_factory=factory, resolver=resolver), calls, options
@@ -215,3 +221,153 @@ async def test_network_exception_is_content_free():
     with pytest.raises(ServiceError) as caught:
         await FileDownloader(resolver=resolver).download(parse_file_input(FILE), max_bytes=9)
     assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("host", ["files.openai.com", "files.oaiusercontent.com"])
+@pytest.mark.parametrize("port", ["", ":443"])
+def test_native_attached_and_generated_sources_accept_the_default_https_port(host, port):
+    parsed = parse_file_input(
+        {
+            **GENERATED_PDF,
+            "download_url": f"https://{host}{port}/content/report.pdf?signature=synthetic",
+        }
+    )
+    assert parsed.mime_type == "application/pdf"
+    assert parsed.file_name == GENERATED_PDF["file_name"]
+    assert parsed.source_identity == f"https://{host}/content/report.pdf"
+    assert "signature" not in repr(parsed)
+
+
+def test_generated_pdf_url_unicode_path_and_query_have_a_canonical_retry_identity():
+    url = (
+        "https://files.openai.com:443/content/Синтетический отчёт.pdf?filename=отчёт.pdf&sig=first"
+    )
+    parsed = parse_file_input({**GENERATED_PDF, "download_url": url})
+    canonical = httpx.URL(url).copy_with(query=None)
+    assert parsed.source_identity == str(canonical)
+    assert parsed.download_url == url
+    assert "sig=" not in parsed.source_identity
+    assert ":443" not in parsed.source_identity
+    assert (
+        parsed.fingerprint_data()
+        == parse_file_input(
+            {**GENERATED_PDF, "download_url": str(canonical) + "?sig=renewed&filename=другой.pdf"}
+        ).fingerprint_data()
+    )
+    assert (
+        parse_file_input(
+            {
+                **GENERATED_PDF,
+                "download_url": "https://files.openai.com/content/different.pdf?sig=first",
+            }
+        ).fingerprint_data()
+        != parsed.fingerprint_data()
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://openai.com/content/file.pdf",
+        "https://chat.openai.com/content/file.pdf",
+        "https://sub.files.openai.com/content/file.pdf",
+        "https://evilfiles.openai.com/content/file.pdf",
+        "https://files.openai.com.evil.example/content/file.pdf",
+        "https://files.openai.com:80/content/file.pdf",
+        "https://files.openai.com:8443/content/file.pdf",
+        "https://files.openai.com:/content/file.pdf",
+        "https://files.openai.com:0443/content/file.pdf",
+        "https://user:synthetic-secret@files.openai.com/content/file.pdf",
+        "https://files.openai.com@evil.example/content/file.pdf",
+        "https://fіles.openai.com/content/file.pdf",  # Cyrillic i.
+        "https://files.openаi.com/content/file.pdf",  # Cyrillic a.
+        "https://files.openai.com./content/file.pdf",
+        " https://files.openai.com/content/file.pdf",
+        "https://files.openai.com/content/отчёт%0a.pdf",
+        "https://files.openai.com/content/отчёт.pdf?name=%00",
+        "https://files.openai.com/content/отчёт.pdf?name=%5cprivate",
+        "https://files.openai.com/content/отчёт\u202e.pdf",
+        "https://files.openai.com/content/отчёт\ud800.pdf",
+        "https://files.openai.com/content/file.pdf#fragment",
+        "https://files.openai.com/content/file.pdf\\name",
+        "https://files.openai.com\t/content/file.pdf",
+    ],
+)
+def test_generated_file_source_keeps_exact_host_and_safe_url_boundaries(url):
+    with pytest.raises(ServiceError) as caught:
+        parse_file_input({**GENERATED_PDF, "download_url": url})
+    assert str(caught.value) == (
+        "File input is invalid; use an attached or generated file supplied by the native client."
+    )
+    assert url not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "addresses",
+    [("127.0.0.1",), ("169.254.169.254",), ("::1",), ("93.184.216.34", "10.0.0.1")],
+)
+async def test_generated_file_host_still_requires_only_public_dns_results(addresses):
+    downloader, calls, options = downloader_for(
+        httpx.Response(200), addresses=addresses, host="files.openai.com"
+    )
+    with pytest.raises(ServiceError, match="could not be downloaded"):
+        await downloader.download(parse_file_input(GENERATED_PDF), max_bytes=200000)
+    assert calls == []
+    assert options == []
+
+
+async def test_generated_pdf_download_preserves_bytes_and_uses_pinned_host_and_tls(monkeypatch):
+    data = (b"%PDF-1.7\n" + b"synthetic-pdf-body\n" * 6400)[: 112 * 1024]
+    assert len(data) == 112 * 1024
+    calls = []
+    resolved = []
+    url = (
+        "https://files.openai.com:443/content/Синтетический отчёт.pdf"
+        "?signature=synthetic&name=отчёт"
+    )
+
+    async def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-length": str(len(data)), "content-type": "application/pdf"},
+            stream=Chunks([data[:65536], data[65536:]]),
+        )
+
+    mock_transport = httpx.MockTransport(handler)
+
+    async def pinned_send(self, request):
+        # Run the real _PinnedTransport rewrite and stop at HTTPX's network boundary.
+        return await mock_transport.handle_async_request(request)
+
+    async def resolver(host):
+        resolved.append(host)
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", pinned_send)
+    parsed = parse_file_input({**GENERATED_PDF, "download_url": url})
+    result = await FileDownloader(resolver=resolver).download(parsed, max_bytes=200000)
+    assert result == data
+    assert resolved == ["files.openai.com"]
+    assert len(calls) == 1
+    request = calls[0]
+    assert request.url.host == "93.184.216.34"
+    assert request.url.port is None
+    assert request.headers["host"] == "files.openai.com"
+    assert request.extensions["sni_hostname"] == "files.openai.com"
+    assert request.headers["accept-encoding"] == "identity"
+    expected = httpx.URL(url)
+    assert request.url.raw_path == expected.raw_path
+
+
+async def test_generated_file_redirect_does_not_follow_or_read_response_body():
+    stream = Chunks([b"synthetic private redirect body"])
+    downloader, calls, options = downloader_for(
+        httpx.Response(302, headers={"location": "http://127.0.0.1/private"}, stream=stream),
+        host="files.openai.com",
+    )
+    with pytest.raises(ServiceError, match="could not be downloaded"):
+        await downloader.download(parse_file_input(GENERATED_PDF), max_bytes=200000)
+    assert len(calls) == 1
+    assert options[0]["follow_redirects"] is False
+    assert stream.read == 0
