@@ -221,9 +221,7 @@ async def test_client_callback_acknowledges_then_sends_guide_and_exact_png_throu
         part.get_param("name", header="content-disposition"): part for part in message.iter_parts()
     }
     assert parts["chat_id"].get_content() == "7001"
-    assert json.loads(
-        parts["reply_markup"].get_payload(decode=True).decode("utf-8")
-    ) == menu_keyboard(linked=True)
+    assert "reply_markup" not in parts
     assert parts["document"].get_filename() == "telegram-icon.png"
     assert parts["document"].get_content_type() == "image/png"
     assert (

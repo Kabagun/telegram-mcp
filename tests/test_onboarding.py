@@ -1079,7 +1079,10 @@ async def test_buttons_select_client_before_enrollment_and_issue_only_own_fresh_
         assert guide["text"].startswith(heading)
         assert f"Код входа: synthetic-code-{index}\n" in guide["text"]
         assert copy_buttons(guide["reply_markup"])["📋 Код"] == f"synthetic-code-{index}"
-        assert bot.documents[-1]["reply_markup"] == menu_keyboard(linked=True)
+        if index == 1:
+            assert bot.documents[-1]["reply_markup"] == menu_keyboard(linked=True)
+        else:
+            assert "reply_markup" not in bot.documents[-1]
     assert bot.acknowledgements == ["synthetic-query"] * 3
     assert len(store.list_users()) == 1
 

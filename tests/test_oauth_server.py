@@ -309,7 +309,7 @@ async def test_oauth_mixed_history_fetches_only_own_outgoing_and_preserves_conne
             BETA, direction="outgoing", include_direction=True
         )[0]
         async with connected(fixture, "alpha") as session:
-            items = payload(await session.call_tool("get_messages", {}))
+            items = payload(await session.call_tool("get_messages", {"order": "oldest"}))
             assert [item["direction"] for item in items] == ["incoming", "outgoing"]
             assert items[-1]["text"] == "Synthetic sent to 7001"
             assert reader.calls == [(7001, [101])]

@@ -530,6 +530,7 @@ class Service:
         client: str,
         source_message: dict[str, Any] | None = None,
     ) -> None:
+        previous_keyboard = self._keyboard(telegram_id)
         try:
             if self._login_code_issuer is not None:
                 username, first_name = self._author_profile(author)
@@ -566,16 +567,18 @@ class Service:
                 deactivate_on_forbidden=False,
             )
         if sent:
+            current_keyboard = self._keyboard(telegram_id)
+            icon_options = (
+                {"reply_markup": current_keyboard} if current_keyboard != previous_keyboard else {}
+            )
             try:
-                await self._bot.send_connector_icon(
-                    telegram_id, reply_markup=self._keyboard(telegram_id)
-                )
+                await self._bot.send_connector_icon(telegram_id, **icon_options)
             except (TelegramAPIError, TelegramTransportError, OSError, ValueError):
                 await self._reply(
                     telegram_id,
                     _CONNECT_ICON_RETRY,
-                    reply_markup=self._keyboard(telegram_id),
                     deactivate_on_forbidden=False,
+                    **icon_options,
                 )
         await self._refresh_commands(telegram_id)
 

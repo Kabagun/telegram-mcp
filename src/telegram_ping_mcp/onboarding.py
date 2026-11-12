@@ -270,7 +270,7 @@ def menu_keyboard(*, linked: bool = False) -> dict:
     rows = [[{"text": "🔌 Подключить AI-приложение"}]]
     if linked:
         rows.append([{"text": "🔗 Отключить всё"}])
-    return {"keyboard": rows, "resize_keyboard": True}
+    return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": True}
 
 
 def unlink_keyboard() -> dict:
@@ -278,6 +278,7 @@ def unlink_keyboard() -> dict:
     return {
         "keyboard": [[{"text": label}] for label in UNLINK_BUTTON_ACTIONS],
         "resize_keyboard": True,
+        "one_time_keyboard": True,
     }
 
 

@@ -251,7 +251,9 @@ async def test_forwarded_buttons_and_commands_are_stored_without_running_bot_act
         with server.runtime.oauth._db() as database:
             assert database.execute("SELECT count(*) FROM login_codes").fetchone()[0] == 0
         async with connected(server) as (session, _):
-            messages = payload(await session.call_tool("get_messages", {}))
+            messages = payload(
+                await session.call_tool("get_messages", {"order": "oldest", "limit": 100})
+            )
             assert [item["text"] for item in messages[: len(controls)]] == controls
             assert [item["caption"] for item in messages[len(controls) :]] == ["/unlink", "/start"]
         assert server.telegram.calls == []

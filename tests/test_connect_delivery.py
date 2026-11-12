@@ -115,7 +115,10 @@ async def test_connect_sends_guide_icon_menu_and_restores_existing_private_bindi
     else:
         assert guide["reply_markup"] == markup
     assert bot.events[-1]["commands"] == command_menu(linked=True)
-    assert bot.documents[0]["reply_markup"] == menu_keyboard(linked=True)
+    if active is None:
+        assert bot.documents[0]["reply_markup"] == menu_keyboard(linked=True)
+    else:
+        assert "reply_markup" not in bot.documents[0]
     if active is None:
         users = store.list_users()
         assert len(users) == 1
@@ -199,13 +202,23 @@ async def test_failed_icon_sends_one_safe_fallback_and_preserves_binding(
         "kind": "message",
         "chat_id": 7001,
         "text": ICON_FAILURE,
-        "reply_markup": menu_keyboard(linked=True),
     }
     assert "synthetic-private" not in str(bot.sends)
     assert "synthetic-private" not in caplog.text
     assert issued == ["synthetic"]
     assert store.list_users() == before
     assert store.get_user("synthetic")["active"] is True
+
+
+async def test_new_connection_icon_fallback_installs_new_auto_hide_navigation(tmp_path):
+    service, store, bot, _ = setup_service(
+        tmp_path, active=None, bot=FakeBot(icon_failure=TelegramTransportError())
+    )
+    await service.handle_update(command())
+    assert store.get_user_by_telegram(7001) is not None
+    assert bot.sends[-1]["text"] == ICON_FAILURE
+    assert bot.sends[-1]["reply_markup"] == menu_keyboard(linked=True)
+    assert bot.sends[-1]["reply_markup"]["one_time_keyboard"] is True
 
 
 @pytest.mark.parametrize("failure", [TelegramAPIError(403), TelegramTransportError()])

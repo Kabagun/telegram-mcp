@@ -108,6 +108,7 @@ def fixture(tmp_path):
         store=store,
         inbox=inbox,
         sender=sender,
+        runtime=runtime,
         own=next(item for item in messages if item["chat_id"] == 7001),
         foreign=next(item for item in messages if item["chat_id"] == 7002),
         group=next(
@@ -143,6 +144,23 @@ async def test_discovery_has_five_tools_and_typed_file_contract(fixture):
         initialized = await session.initialize()
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
         assert set(tools) == VISIBLE
+        history = tools["get_messages"]
+        properties = history.inputSchema["properties"]
+        assert properties["limit"]["default"] == 10
+        assert properties["limit"]["minimum"] == 1
+        assert properties["limit"]["maximum"] == 100
+        assert properties["order"]["default"] == "newest"
+        assert properties["include_content"] == {
+            "default": True,
+            "title": "Include Content",
+            "type": "boolean",
+        }
+        assert {"before_id", "after_id", "since", "until"}.issubset(properties)
+        assert "since is inclusive" in history.description
+        assert "until exclusive" in history.description
+        assert "include_content=false" in history.description
+        assert "minimum returned ID" in history.description
+        assert "maximum returned ID" in history.description
         send = tools["send_message"]
         assert send.meta == {"openai/fileParams": ["file"]}
         assert set(send.inputSchema["required"]) == {"profile_id", "request_id"}
@@ -186,6 +204,105 @@ async def test_discovery_has_five_tools_and_typed_file_contract(fixture):
             )
             assert denied.isError
     assert fixture.sender.calls == []
+
+
+async def test_history_defaults_page_latest_ten_and_support_bounded_metadata_reads(fixture):
+    for index in range(15):
+        fixture.inbox._save(
+            user_key=ALPHA["user_key"],
+            telegram_user_id=7001,
+            chat_id=7001,
+            telegram_message_id=10000 + index,
+            topic_id=None,
+            sent_at=1001 + index,
+            text="Synthetic additional body",
+            caption=None,
+            attachment=None,
+        )
+    expected = fixture.inbox.list_messages(
+        user_key=ALPHA["user_key"], chat_id=7001, order="newest", limit=100
+    )
+    async with create_connected_server_and_client_session(fixture.mcp) as session:
+        first = payload(await session.call_tool("get_messages", {"profile_id": "7001"}))
+        assert [item["id"] for item in first] == [item["id"] for item in expected[:10]]
+        second = payload(
+            await session.call_tool(
+                "get_messages",
+                {"profile_id": "7001", "before_id": min(item["id"] for item in first)},
+            )
+        )
+        assert [item["id"] for item in second] == [item["id"] for item in expected[10:]]
+        args = {
+            "profile_id": "7001",
+            "since": "1970-01-01T00:16:40Z",
+            "until": "1970-01-01T03:16:42+03:00",
+            "include_content": False,
+            "order": "oldest",
+        }
+        rows = payload(await session.call_tool("get_messages", args))
+        assert [item["sent_at"] for item in rows] == [1000, 1001]
+        assert all(item["content_source"] == "metadata" for item in rows)
+        assert all(item["content_available"] is False for item in rows)
+        assert all(item["text"] is item["caption"] is None for item in rows)
+        assert rows[0]["attachment"] == fixture.own["attachment"]
+        single = payload(
+            await session.call_tool("get_messages", {**args, "message_id": rows[0]["id"]})
+        )
+        assert single == rows[0]
+
+
+async def test_oauth_date_filters_do_not_hide_foreign_identity_and_own_miss_returns_none(fixture):
+    async with sessions(fixture, "alpha") as (alpha,):
+        filters = {
+            "since": "2030-01-01T00:00:00Z",
+            "direction": "outgoing",
+            "include_content": False,
+        }
+        for item in (fixture.foreign, fixture.group):
+            denied = await alpha.call_tool("get_messages", {"message_id": item["id"], **filters})
+            assert denied.isError
+            assert "Access denied." in denied.content[0].text
+        missing = await alpha.call_tool(
+            "get_messages", {"message_id": fixture.own["id"], **filters}
+        )
+        assert payload(missing) is None
+        allowed = payload(
+            await alpha.call_tool(
+                "get_messages",
+                {
+                    "message_id": fixture.own["id"],
+                    "include_content": False,
+                    "since": "1970-01-01T00:16:40Z",
+                    "until": "1970-01-01T00:16:41Z",
+                },
+            )
+        )
+        assert allowed["id"] == fixture.own["id"]
+        assert allowed["content_source"] == "metadata"
+        assert allowed["text"] is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"before_id": True},
+        {"after_id": True},
+        {"limit": True},
+        {"include_content": "false"},
+        {"include_content": 0},
+        {"limit": 101},
+    ],
+)
+async def test_history_sdk_rejects_coerced_cursor_boolean_and_body_flags_before_dispatch(
+    fixture, options, monkeypatch
+):
+    def unexpected():
+        pytest.fail("Invalid tool input reached history dispatch")
+
+    monkeypatch.setattr(fixture.runtime, "require_history", unexpected)
+    async with create_connected_server_and_client_session(fixture.mcp) as session:
+        result = await session.call_tool("get_messages", {"profile_id": "7001", **options})
+        assert result.isError
 
 
 async def test_send_accepts_file_with_omitted_optional_metadata(fixture):

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import MAX_ATTACHMENT_BYTES
+from .history_query import HistoryQuery
 from .service import Service, ServiceError, _safe_text, _utf16_length
 from .store import Store
 from .telegram import (
@@ -194,7 +195,9 @@ class InboxStore:
             connection.close()
 
     @staticmethod
-    def _public(row: sqlite3.Row, *, include_direction: bool = False) -> dict[str, Any]:
+    def _public(
+        row: sqlite3.Row, *, include_direction: bool = False, include_content: bool = True
+    ) -> dict[str, Any]:
         result = {
             key: row[key]
             for key in (
@@ -213,8 +216,15 @@ class InboxStore:
         result["read"] = bool(row["is_read"])
         if include_direction:
             result["direction"] = row["direction"]
-            result["content_source"] = "telegram" if row["direction"] == "outgoing" else "stored"
-            result["content_available"] = row["direction"] == "incoming"
+        if include_direction or not include_content:
+            result["content_source"] = (
+                "metadata"
+                if not include_content
+                else "telegram"
+                if row["direction"] == "outgoing"
+                else "stored"
+            )
+            result["content_available"] = include_content and row["direction"] == "incoming"
         result["attachment"] = None
         if row["attachment_id"] is not None:
             result["attachment"] = {
@@ -225,6 +235,16 @@ class InboxStore:
                 "size": row["attachment_size"],
             }
         return result
+
+    @staticmethod
+    def _columns(include_content: bool) -> str:
+        """Metadata reads never ask SQLite to load incoming body columns."""
+        columns = (
+            "id, user_key, telegram_user_id, chat_id, telegram_message_id, topic_id, "
+            "sent_at, received_at, attachment_id, attachment_kind, attachment_name, "
+            "attachment_mime_type, attachment_size, is_read, direction, "
+        )
+        return columns + ("text, caption" if include_content else "NULL AS text, NULL AS caption")
 
     def record_outgoing(self, user: dict[str, Any], message: dict[str, Any]) -> None:
         """Index a confirmed private bot send, excluding its text and caption."""
@@ -349,9 +369,21 @@ class InboxStore:
         *,
         direction: str = "incoming",
         include_direction: bool = False,
+        before_id: int | None = None,
+        order: str = "oldest",
+        since: str | None = None,
+        until: str | None = None,
+        include_content: bool = True,
     ) -> list[dict[str, Any]]:
-        _integer(after_id, minimum=0)
-        _integer(limit, maximum=100)
+        query = HistoryQuery.parse(
+            after_id=after_id,
+            before_id=before_id,
+            limit=limit,
+            order=order,
+            since=since,
+            until=until,
+            include_content=include_content,
+        )
         if not isinstance(include_direction, bool):
             raise ServiceError("Message direction inclusion is invalid.")
         if not isinstance(direction, str) or direction not in {"incoming", "outgoing", "all"}:
@@ -366,6 +398,15 @@ class InboxStore:
                 raise ServiceError("Chat identifier is invalid.")
         conditions = ["id > ?"]
         parameters: list[Any] = [after_id]
+        if query.before_id is not None:
+            conditions.append("id < ?")
+            parameters.append(query.before_id)
+        if query.since is not None:
+            conditions.append("sent_at >= ?")
+            parameters.append(query.since)
+        if query.until is not None:
+            conditions.append("sent_at < ?")
+            parameters.append(query.until)
         if direction != "all":
             conditions.append("direction = ?")
             parameters.append(direction)
@@ -377,27 +418,37 @@ class InboxStore:
             parameters.append(chat_id)
         parameters.append(limit)
         with self._connection() as connection:
+            ordering = "DESC" if order == "newest" else "ASC"
             rows = connection.execute(
-                f"SELECT * FROM inbound_messages WHERE {' AND '.join(conditions)} "
-                "ORDER BY id LIMIT ?",
+                f"SELECT {self._columns(include_content)} FROM inbound_messages "
+                f"WHERE {' AND '.join(conditions)} ORDER BY id {ordering} LIMIT ?",
                 parameters,
             ).fetchall()
-        return [self._public(row, include_direction=include_direction) for row in rows]
+        return [
+            self._public(row, include_direction=include_direction, include_content=include_content)
+            for row in rows
+        ]
 
     def get_message(
-        self, message_id: int, *, include_direction: bool = False
+        self, message_id: int, *, include_direction: bool = False, include_content: bool = True
     ) -> dict[str, Any] | None:
         _integer(message_id)
         if not isinstance(include_direction, bool):
             raise ServiceError("Message direction inclusion is invalid.")
+        if not isinstance(include_content, bool):
+            raise ServiceError("include_content must be a boolean.")
         with self._connection() as connection:
             condition = "" if include_direction else " AND direction = 'incoming'"
             row = connection.execute(
-                "SELECT * FROM inbound_messages WHERE id = ?" + condition, (message_id,)
+                f"SELECT {self._columns(include_content)} FROM inbound_messages WHERE id = ?"
+                + condition,
+                (message_id,),
             )
             message = row.fetchone()
         return (
-            self._public(message, include_direction=include_direction)
+            self._public(
+                message, include_direction=include_direction, include_content=include_content
+            )
             if message is not None
             else None
         )

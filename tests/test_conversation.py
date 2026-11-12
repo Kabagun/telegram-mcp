@@ -98,9 +98,11 @@ async def test_mixed_history_hydrates_each_read_and_preserves_cursor(state):
     incoming(state, user)
     outgoing(state, user)
     outgoing(state, state.users[1], 30)
-    first = await state.history.get_messages(user, limit=1)
+    first = await state.history.get_messages(user, limit=1, order="oldest")
     assert len(first) == 1 and first[0]["direction"] == "incoming"
-    second = await state.history.get_messages(user, after_id=first[0]["id"], limit=1)
+    second = await state.history.get_messages(
+        user, after_id=first[0]["id"], limit=1, order="oldest"
+    )
     assert second[0]["direction"] == "outgoing"
     assert second[0]["text"] == "DO_NOT_PERSIST_SYNTHETIC_OUTGOING"
     assert second[0]["content_source"] == "telegram" and second[0]["content_available"]

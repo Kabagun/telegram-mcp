@@ -84,6 +84,7 @@ async def test_connector_icon_serializes_collapsible_keyboard_in_multipart_field
     markup = {
         "keyboard": [[{"text": label}] for label in list(BUTTON_ACTIONS)[:4]],
         "resize_keyboard": True,
+        "one_time_keyboard": True,
     }
 
     def api(request):
@@ -350,6 +351,7 @@ async def test_message_preserves_each_static_reply_keyboard_label(label):
     markup = {
         "keyboard": [[{"text": label}]],
         "resize_keyboard": True,
+        "one_time_keyboard": True,
     }
 
     def api(request):
@@ -387,7 +389,9 @@ async def test_message_preserves_each_static_reply_keyboard_label(label):
             ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, False, {}),
             ([[{"text": next(iter(BUTTON_ACTIONS))}]], 1, True, {}),
             ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, 1, {}),
-            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"one_time_keyboard": True}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"one_time_keyboard": False}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"one_time_keyboard": 1}),
+            ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"one_time_keyboard": "true"}),
             ([[{"text": next(iter(BUTTON_ACTIONS))}]], True, True, {"inline_keyboard": []}),
             ([[{"text": "Synthetic"}]], True, True, {}),
             ([[{"text": next(iter(BUTTON_ACTIONS)), "request_contact": True}]], True, True, {}),

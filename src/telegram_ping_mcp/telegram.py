@@ -120,9 +120,14 @@ def _validate_reply_markup(reply_markup: object) -> None:
     invalid = "Telegram reply markup is invalid."
     if not isinstance(reply_markup, dict):
         raise ValueError(invalid)
-    is_reply_keyboard = set(reply_markup) == {"keyboard", "resize_keyboard"}
+    is_reply_keyboard = set(reply_markup) in (
+        {"keyboard", "resize_keyboard"},
+        {"keyboard", "resize_keyboard", "one_time_keyboard"},
+    )
     if is_reply_keyboard:
-        if reply_markup["resize_keyboard"] is not True:
+        if reply_markup["resize_keyboard"] is not True or (
+            "one_time_keyboard" in reply_markup and reply_markup["one_time_keyboard"] is not True
+        ):
             raise ValueError(invalid)
         rows = reply_markup["keyboard"]
     elif set(reply_markup) == {"inline_keyboard"}:

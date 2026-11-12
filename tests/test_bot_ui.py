@@ -42,6 +42,7 @@ def test_all_menu_and_details_buttons_match_the_transport_and_static_actions():
         _validate_reply_markup(keyboard)
         assert len(keyboard["keyboard"]) == (2 if linked else 1)
         assert "is_persistent" not in keyboard
+        assert keyboard["one_time_keyboard"] is True
         for row in keyboard["keyboard"]:
             assert len(row) == 1
             assert all(item["text"] in BUTTON_ACTIONS for item in row)
@@ -85,6 +86,7 @@ def test_navigation_only_offers_actions_that_add_information_or_change_a_connect
     assert "все AI-приложения" in unlink_presentation()[0]
     _, confirmation = unlink_presentation()
     assert "inline_keyboard" not in confirmation
+    assert confirmation["one_time_keyboard"] is True
     assert {button["text"] for row in confirmation["keyboard"] for button in row} == set(
         UNLINK_BUTTON_ACTIONS
     )
