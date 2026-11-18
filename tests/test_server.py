@@ -131,6 +131,7 @@ async def test_real_sdk_http_end_to_end_auth_link_send_dedup_optout_group(config
                             "get_messages",
                             "get_attachment",
                             "send_message",
+                            "edit_message",
                         }
                         invitation = structured(
                             await session.call_tool(
@@ -205,7 +206,7 @@ async def test_official_memory_transport_tools(config):
         async with runtime.lifespan():
             async with create_connected_server_and_client_session(create_mcp(runtime)) as session:
                 tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                assert len(tools) == 5
+                assert len(tools) == 6
                 profile = tools["get_profile"]
                 assert profile.meta == {
                     "openai/profile": True,
@@ -230,7 +231,7 @@ async def test_official_memory_transport_tools(config):
                 }
                 for name, tool in tools.items():
                     assert tool.annotations.readOnlyHint is (name in read_only)
-                    assert tool.annotations.destructiveHint is False
+                    assert tool.annotations.destructiveHint is (name == "edit_message")
                     assert tool.annotations.idempotentHint is True
                     assert tool.annotations.openWorldHint is False
                 result = await session.call_tool("get_profile", {})
@@ -322,7 +323,7 @@ async def test_real_stdio_subprocess_sdk_protocol_without_real_telegram(tmp_path
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
             assert (await session.initialize()).serverInfo.name == "Telegram"
-            assert len((await session.list_tools()).tools) == 5
+            assert len((await session.list_tools()).tools) == 6
             result = await session.call_tool("get_profile", {})
             assert result.isError
             assert "personal OAuth connection" in result.content[0].text

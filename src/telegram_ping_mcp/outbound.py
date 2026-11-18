@@ -1,4 +1,4 @@
-"""One-attempt, idempotent outbound sends to verified private profiles."""
+"""One-attempt, idempotent sends and edits for verified private profiles."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 from .config import MAX_ATTACHMENT_BYTES
 from .file_inputs import FileDownloader, FileInput, parse_file_input
 from .inbox import InboundController, InboxStore
-from .service import Service, ServiceError, _integer, _safe_text, _utf16_length
+from .service import Service, ServiceError, _integer, _message_text, _safe_text, _utf16_length
 from .store import Store
 from .telegram import TelegramAPIError, TelegramClient, TelegramTransportError
 
@@ -23,6 +23,9 @@ _ATTACHMENT_UNAVAILABLE = "Attachment is unavailable for this verified user or p
 _ATTACHMENT_FAILED = "Telegram attachment metadata is unavailable."
 _FAILED = "Telegram rejected the message."
 _UNKNOWN = "Telegram delivery status is unknown."
+_EDIT_UNAVAILABLE = "No editable outgoing message matches this profile and history ID."
+_EDIT_FAILED = "Telegram rejected the edit."
+_EDIT_UNKNOWN = "Telegram edit status is unknown. Check the message before editing again."
 _PREPARATION_FAILED = "Attached file could not be prepared."
 _PREPARATION_ERRORS = {
     _UNAVAILABLE,
@@ -80,6 +83,59 @@ class OutboundSender:
         current = self._binding(user["user_key"])
         if any(current[key] != user[key] for key in ("user_key", "telegram_user_id", "chat_id")):
             raise ServiceError(_UNAVAILABLE)
+
+    async def edit(
+        self, *, user_key: str, message_id: int, text: str, request_id: str
+    ) -> dict[str, Any]:
+        request_id = _safe_text(request_id, maximum=128)
+        text = _message_text(text)
+        user = self._binding(user_key)
+        target = self._inbox.get_message(
+            _integer(message_id), include_direction=True, include_content=False
+        )
+        if (
+            target is None
+            or not self._belongs(target, user)
+            or target["direction"] != "outgoing"
+            or target["attachment"] is not None
+        ):
+            raise ServiceError(_EDIT_UNAVAILABLE)
+        telegram_id = _integer(target["telegram_message_id"], maximum=2**31 - 1)
+        payload = ["edit_private", user_key, user["chat_id"], message_id, telegram_id, text]
+        fingerprint = hashlib.sha256(json.dumps(payload).encode("ascii")).hexdigest()
+        try:
+            delivery = self._store.reserve_delivery(request_id, fingerprint)
+        except ValueError:
+            raise ServiceError("Request ID was already used for a different operation.") from None
+        duplicate = not delivery["is_new"]
+        if not duplicate:
+            status, error = "sent", None
+            try:
+                await self._bot.edit_message_text(user["chat_id"], telegram_id, text)
+            except TelegramAPIError as exc:
+                if exc.code >= 500:
+                    status, error = "unknown", _EDIT_UNKNOWN
+                else:
+                    status, error = "failed", _EDIT_FAILED
+            except TelegramTransportError:
+                status, error = "unknown", _EDIT_UNKNOWN
+            except asyncio.CancelledError:
+                self._store.finish_delivery(request_id, "unknown", error=_EDIT_UNKNOWN)
+                raise
+            except Exception:
+                self._store.finish_delivery(request_id, "unknown", error=_EDIT_UNKNOWN)
+                raise ServiceError(_EDIT_UNKNOWN) from None
+            # No native ID in the ledger: an edit must not be backfilled as a new send.
+            self._store.finish_delivery(request_id, status, error=error)
+            delivery = {"status": status}
+            if error is not None:
+                delivery["error"] = error
+        result = Service._result(request_id, delivery, duplicate=duplicate)
+        if result["status"] == "sent":
+            result.update(status="edited", message_id=message_id)
+        elif result["status"] == "sending":
+            result["status"] = "editing"
+        return result
 
     async def send(
         self,

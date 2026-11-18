@@ -27,6 +27,7 @@ TOOLS = {
     "get_messages",
     "get_attachment",
     "send_message",
+    "edit_message",
 }
 
 
@@ -35,6 +36,7 @@ class SyntheticTelegram:
         self.calls = []
         self.sends = []
         self.downloads = 0
+        self.edit_error_code = None
 
     def __call__(self, request):
         if "/file/" in request.url.path:
@@ -57,6 +59,17 @@ class SyntheticTelegram:
         elif method in {"sendMessage", "sendDocument"}:
             self.sends.append(arguments)
             result = {"message_id": len(self.sends), "chat": {"id": arguments["chat_id"]}}
+        elif method == "editMessageText":
+            if self.edit_error_code is not None:
+                return httpx.Response(
+                    self.edit_error_code,
+                    json={
+                        "ok": False,
+                        "error_code": self.edit_error_code,
+                        "description": "Synthetic private Telegram error body",
+                    },
+                )
+            result = {"message_id": arguments["message_id"], "chat": {"id": arguments["chat_id"]}}
         else:
             raise AssertionError("Unexpected Telegram API method")
         return httpx.Response(200, json={"ok": True, "result": result})
@@ -206,6 +219,103 @@ async def test_oauth_profile_id_survives_account_label_changes(server):
                 "nickname": "Chosen account name",
             }
         assert server.telegram.calls == []
+
+
+async def test_edit_outgoing_text_scopes_target_and_deduplicates_exact_retries(server):
+    async with server() as server:
+        async with connected(server, "alpha") as session:
+            profile = {"profile_id": "7001"}
+            sent = payload(
+                await session.call_tool(
+                    "send_message",
+                    {**profile, "request_id": "initial", "text": "Synthetic original text"},
+                )
+            )
+            [target] = payload(
+                await session.call_tool(
+                    "get_messages", {**profile, "direction": "outgoing", "include_content": False}
+                )
+            )
+            assert target["telegram_message_id"] == sent["message_id"]
+            assert target["id"] != sent["message_id"]
+            edit = {
+                **profile,
+                "message_id": target["id"],
+                "request_id": "first-edit",
+                "text": "Synthetic revised text",
+            }
+            assert payload(await session.call_tool("edit_message", edit)) == {
+                "status": "edited",
+                "message_id": target["id"],
+                "request_id": "first-edit",
+                "duplicate": False,
+            }
+            latest = {**edit, "request_id": "second-edit", "text": "Synthetic latest text"}
+            assert payload(await session.call_tool("edit_message", latest))["status"] == "edited"
+            assert payload(await session.call_tool("edit_message", edit))["duplicate"] is True
+
+            inbox = server.runtime.require_inbox()
+            inbox.record_outgoing(
+                server.runtime.require_service().get_user(ALPHA),
+                {
+                    "message_id": 50,
+                    "chat": {"id": 7001},
+                    "document": {"file_id": "synthetic-outgoing-file"},
+                },
+            )
+            [file_row] = [
+                item
+                for item in inbox.list_messages(user_key=ALPHA, direction="outgoing")
+                if item["attachment"] is not None
+            ]
+            for overrides in (
+                {"profile_id": "7002"},
+                {"message_id": server.own["id"]},
+                {"message_id": server.foreign["id"]},
+                {"message_id": server.group["id"]},
+                {"message_id": file_row["id"]},
+                {"message_id": True},
+                {"text": "😀" * 2049},
+                {"text": "Different text using the same request ID"},
+            ):
+                assert (await session.call_tool("edit_message", {**edit, **overrides})).isError
+
+        async with connected(server, "beta") as session:
+            assert (await session.call_tool("edit_message", {**edit, "profile_id": "7002"})).isError
+        assert [args for method, args in server.telegram.calls if method == "editMessageText"] == [
+            {"chat_id": 7001, "message_id": sent["message_id"], "text": edit["text"]},
+            {"chat_id": 7001, "message_id": sent["message_id"], "text": latest["text"]},
+        ]
+        with sqlite3.connect(server.runtime.config.database_path) as database:
+            assert database.execute(
+                "SELECT text, caption FROM inbound_messages WHERE direction = 'outgoing'"
+            ).fetchall() == [(None, None), (None, None)]
+            assert edit["text"] not in "\n".join(database.iterdump())
+            assert latest["text"] not in "\n".join(database.iterdump())
+
+
+@pytest.mark.parametrize(("code", "status"), [(400, "failed"), (502, "unknown")])
+async def test_edit_status_is_sanitized_and_reused_after_telegram_error(server, code, status):
+    async with server() as server:
+        inbox = server.runtime.require_inbox()
+        user = server.runtime.require_service().get_user(ALPHA)
+        inbox.record_outgoing(user, {"message_id": 50, "chat": {"id": 7001}})
+        [target] = inbox.list_messages(user_key=ALPHA, direction="outgoing", include_direction=True)
+        server.telegram.edit_error_code = code
+        async with connected(server, "alpha") as session:
+            args = {
+                "profile_id": "7001",
+                "message_id": target["id"],
+                "request_id": "edit-error",
+                "text": "Synthetic revised text",
+            }
+            first = payload(await session.call_tool("edit_message", args))
+            repeat = payload(await session.call_tool("edit_message", args))
+        assert first["status"] == status
+        assert first["message_id"] is None
+        assert "Synthetic private" not in first["error"]
+        assert repeat == {**first, "duplicate": True}
+        assert [method for method, _ in server.telegram.calls] == ["editMessageText"]
 
 
 async def test_universal_send_runtime_keeps_private_target_reply_file_and_dedup(server):

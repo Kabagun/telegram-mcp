@@ -78,7 +78,14 @@ class TelegramMCP(FastMCP):
     """Advertise the small current interface while accepting cached legacy calls."""
 
     async def list_tools(self) -> list[Tool]:
-        visible = {"get_profile", "get_profiles", "get_messages", "get_attachment", "send_message"}
+        visible = {
+            "get_profile",
+            "get_profiles",
+            "get_messages",
+            "get_attachment",
+            "send_message",
+            "edit_message",
+        }
         return [tool for tool in await super().list_tools() if tool.name in visible]
 
 
@@ -410,6 +417,8 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         "Use get_profiles to identify eligible Telegram accounts, get_messages to read their "
         "conversation, get_attachment to read a file, and send_message for text, files, "
         "or replies. "
+        "To edit a sent bot text in place, use edit_message with the selected profile_id "
+        "and the local id from get_messages, not the Telegram message_id from send_message. "
         "get_messages includes incoming and sent bot messages by default; outgoing bodies "
         "are fetched live from Telegram. Start with a narrow since/until date window and limit; "
         "use include_content=false when locating files or dates, then read selected message IDs. "
@@ -638,6 +647,32 @@ def create_mcp(runtime: Runtime) -> FastMCP:
             file=file,
             send_at=send_at,
             delay_seconds=delay_seconds,
+        )
+        return _delivery_result(result, request_id)
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+        )
+    )
+    async def edit_message(
+        profile_id: str, message_id: StrictInt, text: str, request_id: str
+    ) -> dict[str, Any]:
+        """Replace the text of an indexed outgoing bot message in the selected private chat.
+
+        Use profile_id from get_profiles and the local id from get_messages with
+        direction=outgoing. Do not use the native Telegram ID returned by send_message.
+        Choose an outgoing text message with no attachment. Ask for clarification if
+        several profiles or messages match. Use a new request_id for each intended edit
+        and reuse it only for exact retries. An edited status confirms Telegram applied
+        the edit. If status is unknown, check the message before trying a new request.
+        """
+        user = resolve_profile(profile_id)
+        result = await runtime.require_sender().edit(
+            user_key=user["user_key"],
+            message_id=message_id,
+            text=text,
+            request_id=_request_id(request_id),
         )
         return _delivery_result(result, request_id)
 

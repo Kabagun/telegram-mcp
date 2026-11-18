@@ -20,7 +20,14 @@ from telegram_ping_mcp.store import Store
 
 ALPHA = {"user_key": "synthetic-alpha", "telegram_user_id": 7001}
 BETA = {"user_key": "synthetic-beta", "telegram_user_id": 7002}
-VISIBLE = {"get_profile", "get_profiles", "get_messages", "get_attachment", "send_message"}
+VISIBLE = {
+    "get_profile",
+    "get_profiles",
+    "get_messages",
+    "get_attachment",
+    "send_message",
+    "edit_message",
+}
 
 
 def payload(result):
@@ -139,7 +146,7 @@ async def sessions(fixture, *identities):
         yield connected
 
 
-async def test_discovery_has_five_tools_and_typed_file_contract(fixture):
+async def test_discovery_has_current_tools_and_typed_file_contract(fixture):
     async with create_connected_server_and_client_session(fixture.mcp) as session:
         initialized = await session.initialize()
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
