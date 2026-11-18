@@ -417,8 +417,13 @@ def create_mcp(runtime: Runtime) -> FastMCP:
         "Use get_profiles to identify eligible Telegram accounts, get_messages to read their "
         "conversation, get_attachment to read a file, and send_message for text, files, "
         "or replies. "
-        "To edit a sent bot text in place, use edit_message with the selected profile_id "
-        "and the local id from get_messages, not the Telegram message_id from send_message. "
+        "When a Telegram request clearly adds to or corrects an earlier bot message, "
+        "edit that message in place even if the user does not explicitly say 'edit'. "
+        "For example, 'add that the meeting starts at 3' can refer to the previous "
+        "Telegram message. Find the exact outgoing message with get_messages, read its "
+        "current text and preserve the parts the user did not ask to change. Use the "
+        "selected profile_id and local id with edit_message. If the target or intent is "
+        "unclear, ask whether to update an existing message or send a new one. "
         "get_messages includes incoming and sent bot messages by default; outgoing bodies "
         "are fetched live from Telegram. Start with a narrow since/until date window and limit; "
         "use include_content=false when locating files or dates, then read selected message IDs. "
@@ -662,8 +667,10 @@ def create_mcp(runtime: Runtime) -> FastMCP:
 
         Use profile_id from get_profiles and the local id from get_messages with
         direction=outgoing. Do not use the native Telegram ID returned by send_message.
-        Choose an outgoing text message with no attachment. Ask for clarification if
-        several profiles or messages match. Use a new request_id for each intended edit
+        Use this when a Telegram request adds to or corrects an identifiable earlier
+        message, including follow-ups like "add that the meeting starts at 3". Choose
+        an outgoing text message with no attachment and preserve the rest of its text.
+        Ask if several profiles or messages match. Use a new request_id for each intended edit
         and reuse it only for exact retries. An edited status confirms Telegram applied
         the edit. If status is unknown, check the message before trying a new request.
         """
